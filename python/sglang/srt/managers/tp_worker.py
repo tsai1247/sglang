@@ -15,13 +15,26 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import threading
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from collections import deque
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    ensure_model_parallel_initialized,
+    get_pp_group,
+    get_tp_group,
+    get_world_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+    set_mscclpp_all_reduce,
+    set_torch_symm_mem_all_reduce,
+)
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -29,6 +42,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    LoRAUpdateOutput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -38,18 +52,32 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    DummyTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj,
+    is_npu,
+    set_random_seed,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.patch_torch import register_sgl_tp_rank
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    initialize_dp_attention,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -184,14 +212,26 @@ class BaseTpWorker(ABC):
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        if getattr(self, "is_nano_pearl", False):
+            return LoRAUpdateOutput(
+                success=False,
+                error_message="nano-pearl mode does not support LoRA adapters.",
+            )
         result = self.model_runner.load_lora_adapter(recv_req.to_ref())
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        if getattr(self, "is_nano_pearl", False):
+            return LoRAUpdateOutput(
+                success=False,
+                error_message="nano-pearl mode does not support LoRA adapters.",
+            )
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
+        if getattr(self, "is_nano_pearl", False):
+            return False
         lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
 
@@ -200,6 +240,189 @@ class BaseTpWorker(ABC):
         logits_output = self.model_runner.forward(forward_batch).logits_output
         embeddings = logits_output.embeddings
         return embeddings
+
+
+class NanoPearlStubRunner:
+    """A lightweight model runner that avoids loading target weights in nano-pearl mode."""
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        server_args: ServerArgs,
+        gpu_id: int,
+        tp_rank: int,
+        tp_size: int,
+        moe_ep_rank: int,
+        moe_ep_size: int,
+        pp_rank: int,
+        pp_size: int,
+        nccl_port: int,
+        max_total_num_tokens: int,
+        max_num_seqs: int,
+    ):
+        self.model_config = model_config
+        self.server_args = server_args
+        self.device = server_args.device
+        self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.moe_ep_rank = moe_ep_rank
+        self.moe_ep_size = moe_ep_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+        self.page_size = server_args.page_size
+        self.is_hybrid_swa = model_config.is_hybrid_swa
+        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        self.attention_chunk_size = model_config.attention_chunk_size
+        self.dtype = model_config.dtype
+        self.kv_cache_memory = 0
+        self.forward_pass_id = 0
+        self.init_new_workspace = False
+        self.remote_instance_transfer_engine_session_id = ""
+        self.remote_instance_transfer_engine_weight_info = None
+        self.model = None
+        self.sampler = None
+        self.sliding_window_size = None
+
+        set_global_server_args_for_scheduler(server_args)
+        self._init_distributed(nccl_port)
+
+        if self.page_size != 1:
+            raise RuntimeError("nano-pearl stub runner requires page_size=1.")
+
+        self.max_total_num_tokens = self._normalize_max_tokens(max_total_num_tokens)
+        self.full_max_total_num_tokens = self.max_total_num_tokens
+        self.swa_max_total_num_tokens = self.max_total_num_tokens
+        self.max_running_requests = max_num_seqs
+
+        extra_max_context_len = 4
+        self.req_to_token_pool = ReqToTokenPool(
+            size=max_num_seqs,
+            max_context_len=model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=server_args.enable_memory_saver,
+        )
+
+        need_sort = server_args.disaggregation_mode in ("decode", "prefill")
+        self.token_to_kv_pool_allocator = DummyTokenToKVPoolAllocator(
+            size=self.max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            device=self.device,
+            need_sort=need_sort,
+        )
+        self.token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+
+    def _normalize_max_tokens(self, max_total_num_tokens: int) -> int:
+        if max_total_num_tokens <= 0:
+            raise RuntimeError("nano-pearl requires max_total_num_tokens > 0.")
+        return max_total_num_tokens // self.page_size * self.page_size
+
+    def _init_distributed(self, nccl_port: int) -> None:
+        torch.get_device_module(self.device).set_device(self.gpu_id)
+        if self.device == "cuda":
+            backend = "nccl"
+        elif self.device == "xpu":
+            backend = "xccl"
+        elif self.device == "hpu":
+            backend = "hccl"
+        elif self.device == "npu":
+            backend = "hccl"
+        else:
+            backend = "gloo"
+
+        if self.server_args.dist_init_addr:
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
+        else:
+            dist_init_method = f"tcp://127.0.0.1:{nccl_port}"
+
+        set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+
+        init_distributed_environment(
+            backend=backend,
+            world_size=self.tp_size * self.pp_size,
+            rank=self.tp_size * self.pp_rank + self.tp_rank,
+            local_rank=self.gpu_id,
+            distributed_init_method=dist_init_method,
+            timeout=self.server_args.dist_timeout,
+        )
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=self.tp_size,
+            expert_model_parallel_size=self.moe_ep_size,
+            pipeline_model_parallel_size=self.pp_size,
+        )
+        initialize_dp_attention(
+            server_args=self.server_args,
+            model_config=self.model_config,
+        )
+        if is_npu():
+            register_sgl_tp_rank(self.gpu_id)
+
+        self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
+        self.attention_tp_group = get_attention_tp_group()
+
+    @property
+    def max_token_pool_size(self):
+        return (
+            min(self.swa_max_total_num_tokens, self.max_total_num_tokens)
+            if self.is_hybrid_swa
+            else self.max_total_num_tokens
+        )
+
+    @property
+    def hybrid_gdn_config(self):
+        return None
+
+    @property
+    def mamba2_config(self):
+        return None
+
+    @property
+    def kimi_linear_config(self):
+        return None
+
+    @property
+    def mambaish_config(self):
+        return None
+
+    def update_weights_from_disk(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def init_weights_update_group(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def destroy_weights_update_group(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def init_weights_send_group_for_remote_instance(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def send_weights_to_remote_instance(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def update_weights_from_distributed(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def update_weights_from_tensor(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def update_weights_from_ipc(self, *args, **kwargs):
+        return False, "nano-pearl stub runner does not support weight updates."
+
+    def get_weights_by_name(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl stub runner does not support weight queries.")
+
+    def load_lora_adapter(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl stub runner does not support LoRA.")
+
+    def unload_lora_adapter(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl stub runner does not support LoRA.")
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl stub runner does not execute forward passes.")
 
 
 class TpModelWorker(BaseTpWorker):
@@ -250,24 +473,67 @@ class TpModelWorker(BaseTpWorker):
         else:
             self.dllm_algorithm = None
 
-        self._model_runner = ModelRunner(
-            model_config=self.model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
-            nccl_port=nccl_port,
-            dp_rank=dp_rank,
-            server_args=server_args,
-            is_draft_worker=is_draft_worker,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            draft_model_idx=0 if is_multi_layer_eagle else None,
-        )
+        self.is_nano_pearl = server_args.enable_nano_pearl
+        self.use_pearl_engine = self.is_nano_pearl
+        self.pearl_engine = None
+        self._nano_pearl_sampling_cls = None
+        self._nano_pearl_pending_tokens: Dict[str, deque] = {}
+        self._nano_pearl_seq_id_to_rid: Dict[int, str] = {}
+        self._nano_pearl_generated: set[str] = set()
+        self._nano_pearl_warned_sampling = False
+        self._nano_pearl_logged_sampling = False
+        self._nano_pearl_lock = threading.Lock()
+        self._nano_pearl_max_num_batched_tokens: Optional[int] = None
+        self._nano_pearl_max_num_seqs: Optional[int] = None
+
+        if self.use_pearl_engine:
+            self._init_pearl_engine(server_args)
+
+        if self.use_pearl_engine:
+            max_total_num_tokens = (
+                self._nano_pearl_max_num_batched_tokens
+                or server_args.max_total_tokens
+                or server_args.max_prefill_tokens
+                or self.model_config.context_len
+            )
+            max_num_seqs = (
+                self._nano_pearl_max_num_seqs
+                or server_args.max_running_requests
+                or 512
+            )
+            self._model_runner = NanoPearlStubRunner(
+                model_config=self.model_config,
+                server_args=server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                moe_ep_rank=moe_ep_rank,
+                moe_ep_size=server_args.ep_size,
+                pp_rank=pp_rank,
+                pp_size=server_args.pp_size,
+                nccl_port=nccl_port,
+                max_total_num_tokens=max_total_num_tokens,
+                max_num_seqs=max_num_seqs,
+            )
+        else:
+            self._model_runner = ModelRunner(
+                model_config=self.model_config,
+                mem_fraction_static=server_args.mem_fraction_static,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                moe_ep_rank=moe_ep_rank,
+                moe_ep_size=server_args.ep_size,
+                pp_rank=pp_rank,
+                pp_size=server_args.pp_size,
+                nccl_port=nccl_port,
+                dp_rank=dp_rank,
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                draft_model_idx=0 if is_multi_layer_eagle else None,
+            )
         if is_multi_layer_eagle:
             self.model_runner_list.append(self.model_runner)
             for i in range(1, server_args.speculative_num_steps):
@@ -343,7 +609,9 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_spec = server_args.speculative_algorithm is not None
+        self.enable_spec = (
+            server_args.speculative_algorithm is not None and not self.is_nano_pearl
+        )
         self.hicache_layer_transfer_counter = None
 
     @property
@@ -387,6 +655,184 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _forward_batch_generation_nano_pearl(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        skip_attn_backend_init: bool = False,
+    ) -> GenerationBatchResult:
+        """Run nano-pearl engine to generate tokens and feed them back to the scheduler."""
+        if self.pearl_engine is None:
+            raise RuntimeError("nano-pearl engine is not initialized.")
+
+        if model_worker_batch.return_logprob:
+            raise RuntimeError("nano-pearl engine does not support logprob outputs.")
+
+        if model_worker_batch.is_prefill_only:
+            raise RuntimeError("nano-pearl engine does not support prefill-only batches.")
+
+        new_reqs = [
+            req for req in model_worker_batch.reqs
+            if req.rid not in self._nano_pearl_generated
+        ]
+        if new_reqs:
+            self._nano_pearl_generate_for_reqs(new_reqs)
+
+        next_token_ids: List[int] = []
+        for req in model_worker_batch.reqs:
+            token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+            if not token_queue:
+                token_id = self._nano_pearl_fallback_token(req)
+            else:
+                token_id = token_queue.popleft()
+            next_token_ids.append(token_id)
+
+        next_token_ids_tensor = torch.tensor(
+            next_token_ids,
+            dtype=torch.long,
+            device=model_worker_batch.input_ids.device,
+        )
+        logits_output = LogitsProcessorOutput(next_token_logits=None)
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids_tensor,
+            can_run_cuda_graph=False,
+        )
+
+    def _ensure_nano_pearl_importable(self):
+        nano_pearl_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "nano-PEARL")
+        )
+        if nano_pearl_root not in sys.path:
+            sys.path.append(nano_pearl_root)
+
+    def _init_pearl_engine(self, server_args: ServerArgs):
+        self._ensure_nano_pearl_importable()
+        from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams
+
+        if server_args.tp_size != 1 or server_args.pp_size != 1:
+            raise RuntimeError("nano-pearl engine requires tp_size=1 and pp_size=1.")
+        required_gpus = server_args.draft_model_tp_size + server_args.tp_size
+        available_gpus = torch.cuda.device_count()
+        if available_gpus < required_gpus:
+            raise RuntimeError(
+                "nano-pearl requires at least %d GPUs (draft tp size + target tp size), "
+                "but only %d CUDA device(s) are available."
+                % (required_gpus, available_gpus)
+            )
+
+        max_num_batched_tokens = (
+            server_args.max_total_tokens
+            or server_args.max_prefill_tokens
+            or 16384
+        )
+        max_num_seqs = server_args.max_running_requests or 512
+        max_model_len = self.model_config.context_len
+
+        if max_num_batched_tokens < max_model_len:
+            logger.warning(
+                "nano-pearl requires max_num_batched_tokens >= max_model_len; "
+                "raising max_num_batched_tokens from %s to %s.",
+                max_num_batched_tokens,
+                max_model_len,
+            )
+            max_num_batched_tokens = max_model_len
+
+        self._nano_pearl_max_num_batched_tokens = max_num_batched_tokens
+        self._nano_pearl_max_num_seqs = max_num_seqs
+
+        config = PEARLConfig(
+            server_args.speculative_draft_model_path,
+            server_args.model_path,
+            draft_tensor_parallel_size=server_args.draft_model_tp_size,
+            target_tensor_parallel_size=server_args.tp_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=(
+                server_args.mem_fraction_static
+                if server_args.mem_fraction_static is not None
+                else 0.9
+            ),
+        )
+        self.pearl_engine = PEARLEngine(config)
+        self._nano_pearl_sampling_cls = SamplingParams
+
+    def _nano_pearl_sampling_params(self, sampling_params, max_new_tokens=None):
+        if (
+            not self._nano_pearl_warned_sampling
+            and (
+                sampling_params.top_p != 1.0
+                or sampling_params.top_k not in (None, -1, 1 << 30)
+            )
+        ):
+            logger.warning(
+                "nano-pearl only supports temperature/max_tokens/ignore_eos. "
+                "top_p/top_k will be ignored."
+            )
+            self._nano_pearl_warned_sampling = True
+        if max_new_tokens is None:
+            max_new_tokens = sampling_params.max_new_tokens
+        if not self._nano_pearl_logged_sampling:
+            self._nano_pearl_logged_sampling = True
+        return self._nano_pearl_sampling_cls(
+            temperature=sampling_params.temperature,
+            max_tokens=max_new_tokens,
+            ignore_eos=sampling_params.ignore_eos,
+        )
+
+    def _nano_pearl_generate_for_reqs(self, reqs):
+        with self._nano_pearl_lock:
+            for req in reqs:
+                prompt_ids = self._nano_pearl_get_prompt_ids(req)
+                max_new_tokens = req.sampling_params.max_new_tokens
+                max_new_tokens_limit = max(
+                    self.max_req_len - len(prompt_ids) - 1, 1
+                )
+                if max_new_tokens is None:
+                    max_new_tokens = max_new_tokens_limit
+                else:
+                    max_new_tokens = min(max_new_tokens, max_new_tokens_limit)
+                nano_sampling = self._nano_pearl_sampling_params(
+                    req.sampling_params, max_new_tokens=max_new_tokens
+                )
+                seq_id = self.pearl_engine.add_request(prompt_ids, nano_sampling)
+                self._nano_pearl_seq_id_to_rid[seq_id] = req.rid
+
+            try:
+                output, _ = self.pearl_engine.generate_tokens()
+            except TimeoutError as exc:
+                logger.error("nano-pearl: generate_tokens timed out: %s", exc)
+                for req in reqs:
+                    self._nano_pearl_pending_tokens[req.rid] = deque(
+                        [self._nano_pearl_fallback_token(req)]
+                    )
+                    self._nano_pearl_generated.add(req.rid)
+                return
+
+        for seq_id, token_ids, _ in output:
+            rid = self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
+            if rid is None:
+                continue
+            self._nano_pearl_pending_tokens[rid] = deque(token_ids)
+            self._nano_pearl_generated.add(rid)
+
+    def _nano_pearl_get_prompt_ids(self, req):
+        if req.origin_input_text:
+            return self.pearl_engine.tokenizer.encode(
+                req.origin_input_text,
+                add_special_tokens=False,
+            )
+        return req.origin_input_ids
+
+    def _nano_pearl_fallback_token(self, req):
+        if req.eos_token_ids:
+            return next(iter(req.eos_token_ids))
+        eos_ids = self.model_config.hf_eos_token_id or set()
+        if eos_ids:
+            return next(iter(eos_ids))
+        return 0
+
     def get_remote_instance_transfer_engine_info(self):
         return (
             self.model_runner.remote_instance_transfer_engine_session_id,
@@ -409,10 +855,21 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
+            if self.is_nano_pearl:
+                return self._forward_batch_generation_nano_pearl(
+                    model_worker_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                )
+
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            if self.is_nano_pearl:
+                raise RuntimeError(
+                    "nano-pearl forward path requires model_worker_batch input."
+                )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)

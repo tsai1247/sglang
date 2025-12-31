@@ -115,6 +115,80 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
 
+class DummyKVCache:
+    """A lightweight KV cache placeholder for nano-pearl mode."""
+
+    def __init__(self, size: int, page_size: int, device: str):
+        self.size = size
+        self.page_size = page_size
+        self.device = torch.device(device)
+
+    def get_cpu_copy(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl dummy KV cache does not support CPU copies.")
+
+    def load_cpu_copy(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl dummy KV cache does not support CPU copies.")
+
+
+class DummyTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """An allocator that tracks indices without allocating KV cache memory."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        need_sort: bool,
+    ):
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=DummyKVCache(size, page_size, device),
+            need_sort=need_sort,
+        )
+        self.clear()
+
+    def clear(self):
+        # Reserve index 0 to match the real allocator semantics.
+        self.free_pages = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device=self.device
+        )
+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+    def available_size(self):
+        return len(self.free_pages) + len(self.release_pages)
+
+    def alloc(self, need_size: int):
+        if self.need_sort and need_size > len(self.free_pages):
+            self.merge_and_sort_free()
+        if need_size > len(self.free_pages):
+            return None
+        select_index = self.free_pages[:need_size]
+        self.free_pages = self.free_pages[need_size:]
+        return select_index
+
+    def alloc_extend(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl dummy allocator requires page_size=1.")
+
+    def alloc_decode(self, *args, **kwargs):
+        raise RuntimeError("nano-pearl dummy allocator requires page_size=1.")
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.is_not_in_free_group:
+            if self.need_sort:
+                self.release_pages = torch.cat((self.release_pages, free_index))
+            else:
+                self.free_pages = torch.cat((self.free_pages, free_index))
+        else:
+            self.free_group.append(free_index)
+
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """An allocator managing the indices to kv cache data."""
 

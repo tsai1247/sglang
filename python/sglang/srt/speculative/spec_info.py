@@ -316,6 +316,12 @@ register_speculative_algorithm(
     flags=("NGRAM",),
 )
 
+register_speculative_algorithm(
+    "NANO_PEARL",
+    worker_cls=None,  # No draft worker for nano_pearl
+    flags=(),
+)
+
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.

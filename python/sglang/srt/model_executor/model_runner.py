@@ -3130,3 +3130,123 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+class NanoPearlRunner(ModelRunner):
+    """Runner for nano-pearl predictor speculative decoding."""
+
+    def __init__(
+        self,
+        draft_model_config: ModelConfig,
+        target_model_config: ModelConfig,
+        mem_fraction_static: float,
+        gpu_id: int,
+        tp_rank: int,
+        tp_size: int,
+        moe_ep_rank: int,
+        moe_ep_size: int,
+        pp_rank: int,
+        pp_size: int,
+        nccl_port: int,
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+    ):
+        # Don't call super().__init__() since we manage two runners
+        self.server_args = server_args
+        self.device = server_args.device
+        self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+
+        # Create target runner (pearl predictor model)
+        self.target_runner = ModelRunner(
+            model_config=target_model_config,
+            mem_fraction_static=mem_fraction_static,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=moe_ep_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            nccl_port=nccl_port,
+            dp_rank=dp_rank,
+            server_args=server_args,
+            is_draft_worker=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+        # Create draft runner (nano model) after target runner initializes world group
+        self.draft_runner = ModelRunner(
+            model_config=draft_model_config,
+            mem_fraction_static=mem_fraction_static,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=moe_ep_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            nccl_port=nccl_port,
+            dp_rank=dp_rank,
+            server_args=server_args,
+            is_draft_worker=True,  # Mark as draft
+            # Use separate pools for draft to avoid clobbering target caches.
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+        )
+
+        # Copy some attributes from target_runner for compatibility
+        self.model_config = self.target_runner.model_config
+        self.model = self.target_runner.model
+        self.dtype = self.target_runner.dtype
+        self.kv_cache_memory = self.target_runner.kv_cache_memory
+        self.max_total_num_tokens = self.target_runner.max_total_num_tokens
+        self.req_to_token_pool = self.target_runner.req_to_token_pool
+        self.token_to_kv_pool_allocator = self.target_runner.token_to_kv_pool_allocator
+        self.spec_algorithm = SpeculativeAlgorithm.from_string("nano_pearl")
+        self.is_nano_pearl = True
+        # Copy more attributes
+        self.sliding_window_size = self.target_runner.sliding_window_size
+        self.max_running_requests = self.target_runner.max_running_requests
+        self.page_size = self.target_runner.page_size
+        self.forward_pass_id = self.target_runner.forward_pass_id
+        self.init_new_workspace = self.target_runner.init_new_workspace
+        self.sampler = self.target_runner.sampler
+
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            # Use draft runner (nano) for draft extension
+            return self.draft_runner.forward(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+        else:
+            # Use target runner (pearl predictor) for verification and other modes
+            return self.target_runner.forward(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
+    # Delegate other methods to target_runner for compatibility
+    def __getattr__(self, name):
+        return getattr(self.target_runner, name)

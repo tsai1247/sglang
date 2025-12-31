@@ -141,7 +141,6 @@ def create_hf3fs_client(
     if use_mock:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
 
-        logger.info(f"[Rank Using Hf3fsMockClient for testing")
         return Hf3fsMockClient(path, size, bytes_per_page, entries)
     else:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (

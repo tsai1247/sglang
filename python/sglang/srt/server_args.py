@@ -269,6 +269,11 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
+    # nano_pearl
+    enable_nano_pearl: bool = False
+    draft_model_path: Optional[str] = None
+    draft_model_tp_size: int = 1
+
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -696,6 +701,9 @@ class ServerArgs:
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
+
+        # Handle nano-pearl specific options.
+        self._handle_nano_pearl()
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
@@ -1920,6 +1928,43 @@ class ServerArgs:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
+    def _handle_nano_pearl(self):
+        """Normalize nano-pearl options and avoid legacy speculative decoding side effects."""
+        if not self.enable_nano_pearl and self.speculative_algorithm != "nano_pearl":
+            return
+
+        # Accept either the dedicated flag or --speculative-algorithm nano_pearl.
+        if self.speculative_algorithm == "nano_pearl":
+            self.enable_nano_pearl = True
+
+        if self.speculative_draft_model_path is None:
+            self.speculative_draft_model_path = (
+                self.draft_model_path or self.model_path
+            )
+        if self.speculative_draft_model_revision is None:
+            self.speculative_draft_model_revision = self.revision
+
+        if self.speculative_algorithm is not None:
+            logger.warning(
+                "nano-pearl mode ignores --speculative-algorithm; using the nano-pearl pipeline instead."
+            )
+            self.speculative_algorithm = None
+
+        if (
+            self.draft_model_tp_size is not None
+            and self.draft_model_tp_size != self.tp_size
+        ):
+            logger.warning(
+                "draft-model-tp-size currently falls back to the target tp_size in nano-pearl mode."
+            )
+
+        if self.page_size != 1:
+            logger.warning(
+                "nano-pearl mode requires page_size=1; overriding page_size from %s to 1.",
+                self.page_size,
+            )
+            self.page_size = 1
+
     def _handle_speculative_decoding(self):
         if (
             self.speculative_draft_model_path is not None
@@ -2407,6 +2452,26 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
         )
+
+        parser.add_argument(
+            "--enable-nano-pearl",
+            action="store_true",
+            help="Enable NanoPearl optimization (loads a draft and a target model without legacy speculative decoding).",
+        )
+
+        parser.add_argument(
+            "--draft-model-path",
+            type=str,
+            help="The path of draft model. Required when --enable-nano-pearl is set.",
+        )
+
+        parser.add_argument(
+            "--draft-model-tp-size",
+            type=int,
+            default=1,
+            help="The tensor parallel size of draft model. Required when --enable-nano-pearl is set.",
+        )
+
         parser.add_argument(
             "--tokenizer-path",
             type=str,

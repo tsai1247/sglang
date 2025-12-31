@@ -635,9 +635,12 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        max_new_tokens = self.max_tokens
+        if max_new_tokens is None:
+            max_new_tokens = self.max_completion_tokens
+
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -658,6 +661,8 @@ class ChatCompletionRequest(BaseModel):
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
         }
+        if max_new_tokens is not None:
+            sampling_params["max_new_tokens"] = max_new_tokens
 
         if self.response_format and self.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
