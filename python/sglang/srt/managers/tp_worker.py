@@ -483,6 +483,10 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_warned_sampling = False
         self._nano_pearl_logged_sampling = False
         self._nano_pearl_lock = threading.Lock()
+        self._nano_pearl_stream_cv = threading.Condition()
+        self._nano_pearl_stream_thread: Optional[threading.Thread] = None
+        self._nano_pearl_streaming: set[str] = set()
+        self._nano_pearl_stream_error: Optional[BaseException] = None
         self._nano_pearl_max_num_batched_tokens: Optional[int] = None
         self._nano_pearl_max_num_seqs: Optional[int] = None
 
@@ -676,15 +680,21 @@ class TpModelWorker(BaseTpWorker):
             if req.rid not in self._nano_pearl_generated
         ]
         if new_reqs:
-            self._nano_pearl_generate_for_reqs(new_reqs)
+            if any(req.stream for req in new_reqs):
+                self._nano_pearl_stream_for_reqs(new_reqs)
+            else:
+                self._nano_pearl_generate_for_reqs(new_reqs)
 
         next_token_ids: List[int] = []
         for req in model_worker_batch.reqs:
-            token_queue = self._nano_pearl_pending_tokens.get(req.rid)
-            if not token_queue:
-                token_id = self._nano_pearl_fallback_token(req)
+            if req.rid in self._nano_pearl_streaming:
+                token_id = self._nano_pearl_wait_for_stream_token(req)
             else:
-                token_id = token_queue.popleft()
+                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                if not token_queue:
+                    token_id = self._nano_pearl_fallback_token(req)
+                else:
+                    token_id = token_queue.popleft()
             next_token_ids.append(token_id)
 
         next_token_ids_tensor = torch.tensor(
@@ -816,6 +826,101 @@ class TpModelWorker(BaseTpWorker):
                 continue
             self._nano_pearl_pending_tokens[rid] = deque(token_ids)
             self._nano_pearl_generated.add(rid)
+
+    def _nano_pearl_stream_for_reqs(self, reqs):
+        with self._nano_pearl_stream_cv:
+            while (
+                self._nano_pearl_stream_thread is not None
+                and self._nano_pearl_stream_thread.is_alive()
+            ):
+                self._nano_pearl_stream_cv.wait()
+            self._nano_pearl_stream_error = None
+            for req in reqs:
+                self._nano_pearl_generated.add(req.rid)
+                self._nano_pearl_streaming.add(req.rid)
+                self._nano_pearl_pending_tokens.setdefault(req.rid, deque())
+
+        req_payloads = []
+        req_by_rid = {}
+        for req in reqs:
+            prompt_ids = self._nano_pearl_get_prompt_ids(req)
+            max_new_tokens = req.sampling_params.max_new_tokens
+            max_new_tokens_limit = max(self.max_req_len - len(prompt_ids) - 1, 1)
+            if max_new_tokens is None:
+                max_new_tokens = max_new_tokens_limit
+            else:
+                max_new_tokens = min(max_new_tokens, max_new_tokens_limit)
+            nano_sampling = self._nano_pearl_sampling_params(
+                req.sampling_params, max_new_tokens=max_new_tokens
+            )
+            req_payloads.append((req.rid, prompt_ids, nano_sampling))
+            req_by_rid[req.rid] = req
+
+        def stream_worker():
+            seq_id_to_rid = {}
+            try:
+                with self._nano_pearl_lock:
+                    for rid, prompt_ids, nano_sampling in req_payloads:
+                        seq_id = self.pearl_engine.add_request(
+                            prompt_ids, nano_sampling
+                        )
+                        seq_id_to_rid[seq_id] = rid
+                        self._nano_pearl_seq_id_to_rid[seq_id] = rid
+
+                    for output, done in self.pearl_engine.stream_generate():
+                        with self._nano_pearl_stream_cv:
+                            for seq_id, token_ids in output:
+                                rid = seq_id_to_rid.get(seq_id)
+                                if rid is None:
+                                    continue
+                                self._nano_pearl_pending_tokens[rid].extend(
+                                    token_ids
+                                )
+                            if done:
+                                for seq_id, rid in seq_id_to_rid.items():
+                                    self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
+                                    self._nano_pearl_streaming.discard(rid)
+                                self._nano_pearl_stream_cv.notify_all()
+                                break
+                            self._nano_pearl_stream_cv.notify_all()
+            except Exception as exc:
+                logger.error("nano-pearl: stream_generate failed: %s", exc)
+                with self._nano_pearl_stream_cv:
+                    self._nano_pearl_stream_error = exc
+                    for rid, req in req_by_rid.items():
+                        if not self._nano_pearl_pending_tokens.get(rid):
+                            self._nano_pearl_pending_tokens[rid] = deque(
+                                [self._nano_pearl_fallback_token(req)]
+                            )
+                        self._nano_pearl_streaming.discard(rid)
+                    for seq_id in seq_id_to_rid:
+                        self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
+                    self._nano_pearl_stream_cv.notify_all()
+            finally:
+                with self._nano_pearl_stream_cv:
+                    if (
+                        self._nano_pearl_stream_thread
+                        is threading.current_thread()
+                    ):
+                        self._nano_pearl_stream_thread = None
+                    self._nano_pearl_stream_cv.notify_all()
+
+        stream_thread = threading.Thread(target=stream_worker, daemon=True)
+        with self._nano_pearl_stream_cv:
+            self._nano_pearl_stream_thread = stream_thread
+        stream_thread.start()
+
+    def _nano_pearl_wait_for_stream_token(self, req):
+        while True:
+            with self._nano_pearl_stream_cv:
+                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                if token_queue:
+                    return token_queue.popleft()
+                if req.rid not in self._nano_pearl_streaming:
+                    return self._nano_pearl_fallback_token(req)
+                if self._nano_pearl_stream_error is not None:
+                    return self._nano_pearl_fallback_token(req)
+                self._nano_pearl_stream_cv.wait(timeout=0.5)
 
     def _nano_pearl_get_prompt_ids(self, req):
         if req.origin_input_text:
