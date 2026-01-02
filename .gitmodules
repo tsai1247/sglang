@@ -1,0 +1,4 @@
+[submodule "python/nano-PEARL"]
+	path = python/nano-PEARL
+	url = git@jeff.github.com:tsai1247/nano-PEARL.git
+	branch = jeff/dev
