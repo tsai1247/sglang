@@ -404,6 +404,10 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            if use_nano_pearl and new_accepted_len > 1:
+                req.kv_committed_len += new_accepted_len - 1
+                req.kv_allocated_len += new_accepted_len - 1
+
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 

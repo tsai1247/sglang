@@ -48,6 +48,15 @@ python -m sglang.launch_server \
 - `python/sglang/srt/managers/tp_worker.py`
   - 在 `stream=true` 時走 `stream_generate` 串流流程，逐步提供 token 給 Scheduler。
 
+## 效能優化（與 sglang 排程整合）
+- `python/sglang/srt/managers/tp_worker.py`
+  - 新增常駐 worker thread 驅動 `stream_generate()`，新請求改為排隊送入，不再在主 thread 直接呼叫 `generate_tokens()`。
+  - streaming / non-streaming 共用同一套 token 佇列機制；prefill 階段只餵單 token，decode 階段可一次回填多 token。
+  - `next_token_ids` 改回 CPU tensor，避免 GPU/CPU 同步往返成本。
+  - 新增 `NANO_PEARL_SGLANG_WAIT_TIMEOUT_S` 等待上限，避免卡死時無限阻塞。
+- `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
+  - decode 階段補齊 nano-pearl 多 token 接受時的 KV 長度統計。
+
 ## 已修正的錯誤
 - `world group is not initialized`
   - 原因：draft runner 初始化時觸發 `get_world_group()`，但分散式環境尚未完成。
@@ -66,13 +75,13 @@ python -m sglang.launch_server \
   - `max_new_tokens`
   - `ignore_eos`
 - `top_p` / `top_k` 會被忽略（會提示 warning）。
-- nano-PEARL streaming 目前是以整個 batch 為單位同步推進。
+- nano-PEARL streaming 目前仍是以整個 batch 為單位同步推進，新增請求需等待上一批完成。
 
 ## 行為與流程摘要
 1. `--enable-nano-pearl` 會觸發 PEARLEngine 初始化。
-2. Scheduler 進入 decode 後，TpModelWorker 使用 PEARLEngine 產生 tokens。
-3. 產生的 tokens 轉成 `next_token_ids`，回傳給 Scheduler 進行後續處理。
-4. 若 `/v1/completions` 帶 `stream=true`，nano-PEARL 會改走 `stream_generate`，逐步產生 chunk 並回填 token。
+2. Scheduler 進入 decode 後，TpModelWorker 將 req 送入 nano-pearl worker 佇列。
+3. worker 以 `stream_generate()` 產生 token chunk，回填到 token 佇列。
+4. Scheduler 從佇列取出 `next_token_ids`，回傳給後續處理；`stream=true` 逐步回傳 chunk。
 
 ## 後續可能需要處理的方向
 - 支援 `tp_size > 1` 與 `pp_size > 1` 的 PEARLEngine 配置與分工。

@@ -18,9 +18,11 @@ import logging
 import os
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import TYPE_CHECKING, Dict, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional
 
 import torch
 
@@ -83,6 +85,21 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NanoPearlQueuedRequest:
+    rid: str
+    prompt_ids: List[int]
+    sampling_params: object
+    is_stream: bool
+
+
+@dataclass
+class NanoPearlRequestState:
+    seq_id: int
+    done: bool
+    is_stream: bool
 
 
 class BaseTpWorker(ABC):
@@ -480,18 +497,24 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_pending_tokens: Dict[str, deque] = {}
         self._nano_pearl_seq_id_to_rid: Dict[int, str] = {}
         self._nano_pearl_generated: set[str] = set()
+        self._nano_pearl_active: Dict[str, NanoPearlRequestState] = {}
         self._nano_pearl_warned_sampling = False
         self._nano_pearl_logged_sampling = False
         self._nano_pearl_lock = threading.Lock()
-        self._nano_pearl_stream_cv = threading.Condition()
-        self._nano_pearl_stream_thread: Optional[threading.Thread] = None
-        self._nano_pearl_streaming: set[str] = set()
+        self._nano_pearl_cv = threading.Condition()
+        self._nano_pearl_request_queue: Deque[NanoPearlQueuedRequest] = deque()
+        self._nano_pearl_worker_thread: Optional[threading.Thread] = None
+        self._nano_pearl_worker_shutdown = False
         self._nano_pearl_stream_error: Optional[BaseException] = None
         self._nano_pearl_max_num_batched_tokens: Optional[int] = None
         self._nano_pearl_max_num_seqs: Optional[int] = None
+        self._nano_pearl_wait_timeout_s = float(
+            os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_S", "5")
+        )
 
         if self.use_pearl_engine:
             self._init_pearl_engine(server_args)
+            self._start_nano_pearl_worker()
 
         if self.use_pearl_engine:
             max_total_num_tokens = (
@@ -680,53 +703,53 @@ class TpModelWorker(BaseTpWorker):
             if req.rid not in self._nano_pearl_generated
         ]
         if new_reqs:
-            streaming_reqs = [req for req in new_reqs if req.stream]
-            non_streaming_reqs = [req for req in new_reqs if not req.stream]
-            if streaming_reqs:
-                self._nano_pearl_stream_for_reqs(streaming_reqs)
-            if non_streaming_reqs:
-                self._nano_pearl_generate_for_reqs(non_streaming_reqs)
+            self._nano_pearl_enqueue_reqs(new_reqs)
 
+        self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
+
+        is_prefill = model_worker_batch.forward_mode.is_extend()
         next_token_ids: List[int] = []
         nano_pearl_output_ids: List[List[int]] = []
-        for req in model_worker_batch.reqs:
-            if req.rid in self._nano_pearl_streaming:
-                token_id = self._nano_pearl_wait_for_stream_token(req)
-                next_token_ids.append(token_id)
-                nano_pearl_output_ids.append([])
-                continue
+        with self._nano_pearl_cv:
+            stream_error = self._nano_pearl_stream_error
+            for req in model_worker_batch.reqs:
+                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                state = self._nano_pearl_active.get(req.rid)
 
-            token_queue = self._nano_pearl_pending_tokens.get(req.rid)
-            if not token_queue:
-                token_id = self._nano_pearl_fallback_token(req)
-                next_token_ids.append(token_id)
+                if stream_error is not None or not token_queue:
+                    token_id = self._nano_pearl_fallback_token(req)
+                    next_token_ids.append(token_id)
+                    if req.stream:
+                        nano_pearl_output_ids.append([])
+                    else:
+                        nano_pearl_output_ids.append([token_id])
+                    if state is not None and state.done:
+                        self._nano_pearl_active.pop(req.rid, None)
+                    continue
+
                 if req.stream:
+                    token_id = token_queue.popleft()
+                    next_token_ids.append(token_id)
                     nano_pearl_output_ids.append([])
                 else:
-                    nano_pearl_output_ids.append([token_id])
-                continue
+                    if state is not None and state.done and not is_prefill:
+                        token_ids = list(token_queue)
+                        token_queue.clear()
+                        if not token_ids:
+                            token_ids = [self._nano_pearl_fallback_token(req)]
+                        next_token_ids.append(token_ids[-1])
+                        nano_pearl_output_ids.append(token_ids)
+                    else:
+                        token_id = token_queue.popleft()
+                        next_token_ids.append(token_id)
+                        nano_pearl_output_ids.append([])
 
-            if req.stream:
-                token_id = token_queue.popleft()
-                next_token_ids.append(token_id)
-                nano_pearl_output_ids.append([])
-                if not token_queue:
+                if token_queue is not None and not token_queue:
                     self._nano_pearl_pending_tokens.pop(req.rid, None)
-                continue
+                    if state is not None and state.done:
+                        self._nano_pearl_active.pop(req.rid, None)
 
-            token_ids = list(token_queue)
-            token_queue.clear()
-            self._nano_pearl_pending_tokens.pop(req.rid, None)
-            if not token_ids:
-                token_ids = [self._nano_pearl_fallback_token(req)]
-            next_token_ids.append(token_ids[-1])
-            nano_pearl_output_ids.append(token_ids)
-
-        next_token_ids_tensor = torch.tensor(
-            next_token_ids,
-            dtype=torch.long,
-            device=model_worker_batch.input_ids.device,
-        )
+        next_token_ids_tensor = torch.tensor(next_token_ids, dtype=torch.long)
         logits_output = LogitsProcessorOutput(next_token_logits=None)
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -817,57 +840,99 @@ class TpModelWorker(BaseTpWorker):
             ignore_eos=sampling_params.ignore_eos,
         )
 
-    def _nano_pearl_generate_for_reqs(self, reqs):
-        with self._nano_pearl_lock:
-            for req in reqs:
-                prompt_ids = self._nano_pearl_get_prompt_ids(req)
-                max_new_tokens = req.sampling_params.max_new_tokens
-                max_new_tokens_limit = max(
-                    self.max_req_len - len(prompt_ids) - 1, 1
-                )
-                if max_new_tokens is None:
-                    max_new_tokens = max_new_tokens_limit
-                else:
-                    max_new_tokens = min(max_new_tokens, max_new_tokens_limit)
-                nano_sampling = self._nano_pearl_sampling_params(
-                    req.sampling_params, max_new_tokens=max_new_tokens
-                )
-                seq_id = self.pearl_engine.add_request(prompt_ids, nano_sampling)
-                self._nano_pearl_seq_id_to_rid[seq_id] = req.rid
+    def _start_nano_pearl_worker(self):
+        if self._nano_pearl_worker_thread is not None:
+            return
 
-            try:
-                output, _ = self.pearl_engine.generate_tokens()
-            except TimeoutError as exc:
-                logger.error("nano-pearl: generate_tokens timed out: %s", exc)
-                for req in reqs:
-                    self._nano_pearl_pending_tokens[req.rid] = deque(
-                        [self._nano_pearl_fallback_token(req)]
-                    )
-                    self._nano_pearl_generated.add(req.rid)
-                return
+        def _worker():
+            while True:
+                with self._nano_pearl_cv:
+                    while (
+                        not self._nano_pearl_request_queue
+                        and not self._nano_pearl_worker_shutdown
+                    ):
+                        self._nano_pearl_cv.wait()
+                    if self._nano_pearl_worker_shutdown:
+                        return
+                    batch = list(self._nano_pearl_request_queue)
+                    self._nano_pearl_request_queue.clear()
+                    self._nano_pearl_stream_error = None
 
-        for seq_id, token_ids, _ in output:
-            rid = self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
-            if rid is None:
-                continue
-            self._nano_pearl_pending_tokens[rid] = deque(token_ids)
-            self._nano_pearl_generated.add(rid)
+                if self.pearl_engine is None:
+                    with self._nano_pearl_cv:
+                        self._nano_pearl_stream_error = RuntimeError(
+                            "nano-pearl engine is not initialized."
+                        )
+                        for req in batch:
+                            state = self._nano_pearl_active.get(req.rid)
+                            if state:
+                                state.done = True
+                        self._nano_pearl_cv.notify_all()
+                    continue
 
-    def _nano_pearl_stream_for_reqs(self, reqs):
-        with self._nano_pearl_stream_cv:
-            while (
-                self._nano_pearl_stream_thread is not None
-                and self._nano_pearl_stream_thread.is_alive()
-            ):
-                self._nano_pearl_stream_cv.wait()
-            self._nano_pearl_stream_error = None
-            for req in reqs:
-                self._nano_pearl_generated.add(req.rid)
-                self._nano_pearl_streaming.add(req.rid)
-                self._nano_pearl_pending_tokens.setdefault(req.rid, deque())
+                seq_id_to_rid: Dict[int, str] = {}
+                try:
+                    with self._nano_pearl_lock:
+                        for req in batch:
+                            seq_id = self.pearl_engine.add_request(
+                                req.prompt_ids, req.sampling_params
+                            )
+                            seq_id_to_rid[seq_id] = req.rid
+                            with self._nano_pearl_cv:
+                                self._nano_pearl_seq_id_to_rid[seq_id] = req.rid
+                                self._nano_pearl_active[req.rid] = (
+                                    NanoPearlRequestState(
+                                        seq_id=seq_id,
+                                        done=False,
+                                        is_stream=req.is_stream,
+                                    )
+                                )
+                                self._nano_pearl_pending_tokens.setdefault(
+                                    req.rid, deque()
+                                )
 
-        req_payloads = []
-        req_by_rid = {}
+                        for output, done in self.pearl_engine.stream_generate():
+                            with self._nano_pearl_cv:
+                                for seq_id, token_ids in output:
+                                    rid = self._nano_pearl_seq_id_to_rid.get(
+                                        seq_id
+                                    )
+                                    if rid is None:
+                                        continue
+                                    self._nano_pearl_pending_tokens.setdefault(
+                                        rid, deque()
+                                    ).extend(token_ids)
+                                if done:
+                                    for rid in seq_id_to_rid.values():
+                                        state = self._nano_pearl_active.get(rid)
+                                        if state is not None:
+                                            state.done = True
+                                    for seq_id in seq_id_to_rid:
+                                        self._nano_pearl_seq_id_to_rid.pop(
+                                            seq_id, None
+                                        )
+                                self._nano_pearl_cv.notify_all()
+                            if done:
+                                break
+                except Exception as exc:
+                    logger.error("nano-pearl: stream_generate failed: %s", exc)
+                    with self._nano_pearl_cv:
+                        self._nano_pearl_stream_error = exc
+                        for rid in seq_id_to_rid.values():
+                            state = self._nano_pearl_active.get(rid)
+                            if state is not None:
+                                state.done = True
+                        for seq_id in seq_id_to_rid:
+                            self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
+                        self._nano_pearl_cv.notify_all()
+
+        self._nano_pearl_worker_thread = threading.Thread(
+            target=_worker, daemon=True
+        )
+        self._nano_pearl_worker_thread.start()
+
+    def _nano_pearl_enqueue_reqs(self, reqs):
+        queued = []
         for req in reqs:
             prompt_ids = self._nano_pearl_get_prompt_ids(req)
             max_new_tokens = req.sampling_params.max_new_tokens
@@ -879,74 +944,47 @@ class TpModelWorker(BaseTpWorker):
             nano_sampling = self._nano_pearl_sampling_params(
                 req.sampling_params, max_new_tokens=max_new_tokens
             )
-            req_payloads.append((req.rid, prompt_ids, nano_sampling))
-            req_by_rid[req.rid] = req
+            queued.append(
+                NanoPearlQueuedRequest(
+                    rid=req.rid,
+                    prompt_ids=prompt_ids,
+                    sampling_params=nano_sampling,
+                    is_stream=req.stream,
+                )
+            )
 
-        def stream_worker():
-            seq_id_to_rid = {}
-            try:
-                with self._nano_pearl_lock:
-                    for rid, prompt_ids, nano_sampling in req_payloads:
-                        seq_id = self.pearl_engine.add_request(
-                            prompt_ids, nano_sampling
-                        )
-                        seq_id_to_rid[seq_id] = rid
-                        self._nano_pearl_seq_id_to_rid[seq_id] = rid
+        with self._nano_pearl_cv:
+            for item in queued:
+                self._nano_pearl_request_queue.append(item)
+                self._nano_pearl_generated.add(item.rid)
+                self._nano_pearl_pending_tokens.setdefault(item.rid, deque())
+            self._nano_pearl_cv.notify_all()
 
-                    for output, done in self.pearl_engine.stream_generate():
-                        with self._nano_pearl_stream_cv:
-                            for seq_id, token_ids in output:
-                                rid = seq_id_to_rid.get(seq_id)
-                                if rid is None:
-                                    continue
-                                self._nano_pearl_pending_tokens[rid].extend(
-                                    token_ids
-                                )
-                            if done:
-                                for seq_id, rid in seq_id_to_rid.items():
-                                    self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
-                                    self._nano_pearl_streaming.discard(rid)
-                                self._nano_pearl_stream_cv.notify_all()
-                                break
-                            self._nano_pearl_stream_cv.notify_all()
-            except Exception as exc:
-                logger.error("nano-pearl: stream_generate failed: %s", exc)
-                with self._nano_pearl_stream_cv:
-                    self._nano_pearl_stream_error = exc
-                    for rid, req in req_by_rid.items():
-                        if not self._nano_pearl_pending_tokens.get(rid):
-                            self._nano_pearl_pending_tokens[rid] = deque(
-                                [self._nano_pearl_fallback_token(req)]
-                            )
-                        self._nano_pearl_streaming.discard(rid)
-                    for seq_id in seq_id_to_rid:
-                        self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
-                    self._nano_pearl_stream_cv.notify_all()
-            finally:
-                with self._nano_pearl_stream_cv:
-                    if (
-                        self._nano_pearl_stream_thread
-                        is threading.current_thread()
-                    ):
-                        self._nano_pearl_stream_thread = None
-                    self._nano_pearl_stream_cv.notify_all()
-
-        stream_thread = threading.Thread(target=stream_worker, daemon=True)
-        with self._nano_pearl_stream_cv:
-            self._nano_pearl_stream_thread = stream_thread
-        stream_thread.start()
-
-    def _nano_pearl_wait_for_stream_token(self, req):
-        while True:
-            with self._nano_pearl_stream_cv:
-                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
-                if token_queue:
-                    return token_queue.popleft()
-                if req.rid not in self._nano_pearl_streaming:
-                    return self._nano_pearl_fallback_token(req)
+    def _nano_pearl_wait_for_tokens(self, reqs):
+        deadline = time.monotonic() + self._nano_pearl_wait_timeout_s
+        with self._nano_pearl_cv:
+            while True:
                 if self._nano_pearl_stream_error is not None:
-                    return self._nano_pearl_fallback_token(req)
-                self._nano_pearl_stream_cv.wait(timeout=0.5)
+                    return
+                all_ready = True
+                for req in reqs:
+                    token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                    state = self._nano_pearl_active.get(req.rid)
+                    if token_queue:
+                        continue
+                    if state is None:
+                        all_ready = False
+                        break
+                    if state.done:
+                        continue
+                    all_ready = False
+                    break
+                if all_ready:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._nano_pearl_cv.wait(timeout=min(0.05, remaining))
 
     def _nano_pearl_get_prompt_ids(self, req):
         if req.origin_input_ids:
