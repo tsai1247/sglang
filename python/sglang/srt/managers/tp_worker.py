@@ -680,22 +680,47 @@ class TpModelWorker(BaseTpWorker):
             if req.rid not in self._nano_pearl_generated
         ]
         if new_reqs:
-            if any(req.stream for req in new_reqs):
-                self._nano_pearl_stream_for_reqs(new_reqs)
-            else:
-                self._nano_pearl_generate_for_reqs(new_reqs)
+            streaming_reqs = [req for req in new_reqs if req.stream]
+            non_streaming_reqs = [req for req in new_reqs if not req.stream]
+            if streaming_reqs:
+                self._nano_pearl_stream_for_reqs(streaming_reqs)
+            if non_streaming_reqs:
+                self._nano_pearl_generate_for_reqs(non_streaming_reqs)
 
         next_token_ids: List[int] = []
+        nano_pearl_output_ids: List[List[int]] = []
         for req in model_worker_batch.reqs:
             if req.rid in self._nano_pearl_streaming:
                 token_id = self._nano_pearl_wait_for_stream_token(req)
-            else:
-                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
-                if not token_queue:
-                    token_id = self._nano_pearl_fallback_token(req)
+                next_token_ids.append(token_id)
+                nano_pearl_output_ids.append([])
+                continue
+
+            token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+            if not token_queue:
+                token_id = self._nano_pearl_fallback_token(req)
+                next_token_ids.append(token_id)
+                if req.stream:
+                    nano_pearl_output_ids.append([])
                 else:
-                    token_id = token_queue.popleft()
-            next_token_ids.append(token_id)
+                    nano_pearl_output_ids.append([token_id])
+                continue
+
+            if req.stream:
+                token_id = token_queue.popleft()
+                next_token_ids.append(token_id)
+                nano_pearl_output_ids.append([])
+                if not token_queue:
+                    self._nano_pearl_pending_tokens.pop(req.rid, None)
+                continue
+
+            token_ids = list(token_queue)
+            token_queue.clear()
+            self._nano_pearl_pending_tokens.pop(req.rid, None)
+            if not token_ids:
+                token_ids = [self._nano_pearl_fallback_token(req)]
+            next_token_ids.append(token_ids[-1])
+            nano_pearl_output_ids.append(token_ids)
 
         next_token_ids_tensor = torch.tensor(
             next_token_ids,
@@ -707,6 +732,7 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids_tensor,
             can_run_cuda_graph=False,
+            nano_pearl_output_ids=nano_pearl_output_ids,
         )
 
     def _ensure_nano_pearl_importable(self):
@@ -923,12 +949,14 @@ class TpModelWorker(BaseTpWorker):
                 self._nano_pearl_stream_cv.wait(timeout=0.5)
 
     def _nano_pearl_get_prompt_ids(self, req):
+        if req.origin_input_ids:
+            return req.origin_input_ids
         if req.origin_input_text:
             return self.pearl_engine.tokenizer.encode(
                 req.origin_input_text,
                 add_special_tokens=False,
             )
-        return req.origin_input_ids
+        return []
 
     def _nano_pearl_fallback_token(self, req):
         if req.eos_token_ids:

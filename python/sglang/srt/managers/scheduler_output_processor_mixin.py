@@ -93,6 +93,7 @@ class SchedulerOutputProcessorMixin:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            nano_pearl_output_ids = result.nano_pearl_output_ids
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -121,8 +122,15 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.prefill_finished_ts = time.time()
 
                     # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-                    req.check_finished()
+                    accepted_ids = None
+                    if nano_pearl_output_ids is not None:
+                        accepted_ids = nano_pearl_output_ids[i]
+                    if accepted_ids:
+                        req.output_ids.extend(accepted_ids)
+                        req.check_finished(new_accepted_len=len(accepted_ids))
+                    else:
+                        req.output_ids.append(next_token_id)
+                        req.check_finished()
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -172,7 +180,9 @@ class SchedulerOutputProcessorMixin:
                     if req.grammar is not None:
                         # FIXME: this try-except block is for handling unexpected xgrammar issue.
                         try:
-                            req.grammar.accept_token(next_token_id)
+                            token_ids = accepted_ids or [next_token_id]
+                            for token_id in token_ids:
+                                req.grammar.accept_token(token_id)
                         except ValueError as e:
                             # Grammar accept_token can raise ValueError if the token is not in the grammar.
                             # This can happen if the grammar is not set correctly or the token is invalid.
@@ -339,6 +349,7 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        nano_pearl_output_ids = result.nano_pearl_output_ids
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
@@ -347,7 +358,16 @@ class SchedulerOutputProcessorMixin:
         elif batch.is_eagle_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
+        use_nano_pearl = (
+            nano_pearl_output_ids is not None and batch.spec_algorithm.is_none()
+        )
+        if use_nano_pearl:
+            generated = 0
+            for token_ids in nano_pearl_output_ids:
+                generated += len(token_ids) if token_ids else 1
+            self.num_generated_tokens += generated
+        else:
+            self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
@@ -369,7 +389,10 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if use_nano_pearl and nano_pearl_output_ids[i]:
+                req.output_ids.extend(nano_pearl_output_ids[i])
+                new_accepted_len = len(nano_pearl_output_ids[i])
+            elif batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_eagle_v2:
                 # Only v2 eagle's output_ids are updated here.
@@ -420,7 +443,10 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if use_nano_pearl and nano_pearl_output_ids[i]:
+                        for token_id in nano_pearl_output_ids[i]:
+                            req.grammar.accept_token(token_id)
+                    elif batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_eagle_v2:
