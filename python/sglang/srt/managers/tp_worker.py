@@ -962,59 +962,40 @@ class TpModelWorker(BaseTpWorker):
                         if not has_active and not has_pending:
                             break
 
-                        outputs = []
-                        done = False
                         flush_steps = min(
                             self._nano_pearl_prefetch_flush_steps,
                             self._nano_pearl_prefetch_steps,
                         )
-                        for _ in range(self._nano_pearl_prefetch_steps):
+                        steps_left = self._nano_pearl_prefetch_steps
+                        while steps_left > 0:
+                            steps = min(flush_steps, steps_left)
+                            with self._nano_pearl_cv:
+                                if self._nano_pearl_request_queue:
+                                    steps = 1
                             with self._nano_pearl_lock:
                                 step_output, step_done = (
-                                    self.pearl_engine.stream_generate_step()
+                                    self.pearl_engine.stream_generate_steps(steps)
                                 )
-                            outputs.append(step_output)
                             with self._nano_pearl_cv:
-                                should_flush = (
-                                    step_done
-                                    or len(outputs) >= flush_steps
-                                    or self._nano_pearl_request_queue
-                                )
-                                if should_flush:
-                                    for output in outputs:
-                                        for seq_id, token_ids in output:
-                                            rid = self._nano_pearl_seq_id_to_rid.get(
-                                                seq_id
-                                            )
-                                            if rid is None:
-                                                continue
-                                            self._nano_pearl_pending_tokens.setdefault(
-                                                rid, deque()
-                                            ).extend(token_ids)
-                                    outputs.clear()
-                                    if step_done:
-                                        for rid in list(self._nano_pearl_active):
-                                            state = self._nano_pearl_active.get(rid)
-                                            if state is not None:
-                                                state.done = True
-                                        self._nano_pearl_seq_id_to_rid.clear()
-                                    self._nano_pearl_cv.notify_all()
-                                if step_done or self._nano_pearl_request_queue:
-                                    done = step_done
-                                    break
-                        if outputs:
-                            with self._nano_pearl_cv:
-                                for output in outputs:
-                                    for seq_id, token_ids in output:
-                                        rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
-                                        if rid is None:
-                                            continue
-                                        self._nano_pearl_pending_tokens.setdefault(
-                                            rid, deque()
-                                        ).extend(token_ids)
+                                for seq_id, token_ids in step_output:
+                                    rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                                    if rid is None:
+                                        continue
+                                    self._nano_pearl_pending_tokens.setdefault(
+                                        rid, deque()
+                                    ).extend(token_ids)
+                                if step_done:
+                                    for rid in list(self._nano_pearl_active):
+                                        state = self._nano_pearl_active.get(rid)
+                                        if state is not None:
+                                            state.done = True
+                                    self._nano_pearl_seq_id_to_rid.clear()
                                 self._nano_pearl_cv.notify_all()
+                                if step_done or self._nano_pearl_request_queue:
+                                    break
+                            steps_left -= steps
                 except Exception as exc:
-                    logger.error("nano-pearl: stream_generate_step failed: %s", exc)
+                    logger.error("nano-pearl: stream_generate_steps failed: %s", exc)
                     with self._nano_pearl_cv:
                         self._nano_pearl_stream_error = exc
                         for rid in list(self._nano_pearl_active):
