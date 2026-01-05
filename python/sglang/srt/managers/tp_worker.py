@@ -733,6 +733,7 @@ class TpModelWorker(BaseTpWorker):
             self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
             next_token_ids: List[int] = []
             nano_pearl_output_ids: List[List[int]] = []
+            no_token_id = -1
             with self._nano_pearl_cv:
                 stream_error = self._nano_pearl_stream_error
                 no_engine_active = (
@@ -758,13 +759,12 @@ class TpModelWorker(BaseTpWorker):
                                 next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
                             else:
-                                token_id = self._nano_pearl_fallback_token(req)
-                                next_token_ids.append(token_id)
+                                next_token_ids.append(no_token_id)
                                 nano_pearl_output_ids.append([])
                                 if req.rid not in self._nano_pearl_missing_token_warned:
                                     logger.warning(
                                         "nano-pearl token queue empty for %s; "
-                                        "using fallback token.",
+                                        "skipping token this step.",
                                         req.rid,
                                     )
                                     self._nano_pearl_missing_token_warned.add(req.rid)
@@ -1263,7 +1263,16 @@ class TpModelWorker(BaseTpWorker):
                                 len(self._nano_pearl_request_queue),
                                 len(self._nano_pearl_seq_id_to_rid),
                             )
-                    return
+                    if (
+                        self._nano_pearl_kick_on_timeout
+                        and not self._nano_pearl_request_queue
+                        and self._nano_pearl_seq_id_to_rid
+                    ):
+                        if self._nano_pearl_try_kick():
+                            deadline = time.monotonic() + timeout
+                            continue
+                    deadline = time.monotonic() + timeout
+                    continue
                 self._nano_pearl_cv.wait(timeout=min(0.05, remaining))
 
     def _nano_pearl_try_kick(self) -> bool:
