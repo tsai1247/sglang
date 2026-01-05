@@ -522,6 +522,14 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_wait_timeout_limit = max(
             int(os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_LIMIT", "3")), 0
         )
+        wait_all_default = "0"
+        self._nano_pearl_wait_all_tokens = bool(
+            int(
+                os.getenv(
+                    "NANO_PEARL_SGLANG_WAIT_ALL_TOKENS", wait_all_default
+                )
+            )
+        )
         self._nano_pearl_wait_timeout_hits = 0
         self._nano_pearl_kick_on_timeout = bool(
             int(os.getenv("NANO_PEARL_SGLANG_KICK_ON_TIMEOUT", "1"))
@@ -733,6 +741,7 @@ class TpModelWorker(BaseTpWorker):
             self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
             next_token_ids: List[int] = []
             nano_pearl_output_ids: List[List[int]] = []
+            nano_pearl_finished: List[bool] = []
             no_token_id = -1
             with self._nano_pearl_cv:
                 stream_error = self._nano_pearl_stream_error
@@ -749,18 +758,27 @@ class TpModelWorker(BaseTpWorker):
                         token_id = self._nano_pearl_fallback_token(req)
                         next_token_ids.append(token_id)
                         nano_pearl_output_ids.append([])
+                        nano_pearl_finished.append(False)
                         if state is not None and state.done:
                             self._nano_pearl_active.pop(req.rid, None)
                         continue
                     if not token_queue:
+                        if state is not None and state.done:
+                            next_token_ids.append(no_token_id)
+                            nano_pearl_output_ids.append([])
+                            nano_pearl_finished.append(True)
+                            self._nano_pearl_active.pop(req.rid, None)
+                            continue
                         if state is None or not state.done:
                             if no_engine_active:
                                 token_id = self._nano_pearl_fallback_token(req)
                                 next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
+                                nano_pearl_finished.append(False)
                             else:
                                 next_token_ids.append(no_token_id)
                                 nano_pearl_output_ids.append([])
+                                nano_pearl_finished.append(False)
                                 if req.rid not in self._nano_pearl_missing_token_warned:
                                     logger.warning(
                                         "nano-pearl token queue empty for %s; "
@@ -772,6 +790,7 @@ class TpModelWorker(BaseTpWorker):
                         token_id = self._nano_pearl_fallback_token(req)
                         next_token_ids.append(token_id)
                         nano_pearl_output_ids.append([])
+                        nano_pearl_finished.append(False)
                         if state is not None and state.done:
                             self._nano_pearl_active.pop(req.rid, None)
                         continue
@@ -783,6 +802,7 @@ class TpModelWorker(BaseTpWorker):
                         )[0]
                         next_token_ids.append(token_id)
                         nano_pearl_output_ids.append([])
+                        nano_pearl_finished.append(False)
                     else:
                         token_ids = list(token_queue)
                         token_queue.clear()
@@ -791,15 +811,18 @@ class TpModelWorker(BaseTpWorker):
                         token_ids = self._nano_pearl_sanitize_token_ids(req, token_ids)
                         next_token_ids.append(token_ids[0])
                         nano_pearl_output_ids.append(token_ids)
+                        nano_pearl_finished.append(False)
 
                     if token_queue is not None and not token_queue:
                         self._nano_pearl_pending_tokens.pop(req.rid, None)
                         if state is not None and state.done:
                             self._nano_pearl_active.pop(req.rid, None)
-            return next_token_ids, nano_pearl_output_ids
+            return next_token_ids, nano_pearl_output_ids, nano_pearl_finished
 
         def _fill_batch_result(batch_result: GenerationBatchResult):
-            next_token_ids, nano_pearl_output_ids = _collect_tokens()
+            next_token_ids, nano_pearl_output_ids, nano_pearl_finished = (
+                _collect_tokens()
+            )
             next_token_device = torch.device("cpu")
             if not self.server_args.disable_overlap_schedule:
                 if model_worker_batch.input_ids is not None:
@@ -810,6 +833,7 @@ class TpModelWorker(BaseTpWorker):
                 next_token_ids, dtype=torch.long, device=next_token_device
             )
             batch_result.nano_pearl_output_ids = nano_pearl_output_ids
+            batch_result.nano_pearl_finished = nano_pearl_finished
             return batch_result
 
         logits_output = LogitsProcessorOutput(next_token_logits=None)
@@ -1151,7 +1175,10 @@ class TpModelWorker(BaseTpWorker):
         timeout = self._nano_pearl_wait_timeout_s
         if any(req.stream for req in reqs):
             timeout = min(timeout, self._nano_pearl_stream_wait_timeout_s)
-        require_all_ready = not self.server_args.disable_overlap_schedule
+        require_all_ready = (
+            self._nano_pearl_wait_all_tokens
+            or not self.server_args.disable_overlap_schedule
+        )
         deadline = time.monotonic() + timeout
         with self._nano_pearl_cv:
             while True:

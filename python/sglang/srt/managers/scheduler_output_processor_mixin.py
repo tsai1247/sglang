@@ -17,6 +17,8 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
     Req,
     RequestStage,
     ScheduleBatch,
@@ -339,6 +341,7 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
         nano_pearl_output_ids = result.nano_pearl_output_ids
+        nano_pearl_finished = result.nano_pearl_finished
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -504,12 +507,40 @@ class SchedulerOutputProcessorMixin:
                 if per_req_token_ids is None:
                     raise RuntimeError("nano-pearl token list is missing.")
                 token_ids = per_req_token_ids[i]
-                if not token_ids:
+                force_finish = bool(
+                    nano_pearl_finished is not None
+                    and i < len(nano_pearl_finished)
+                    and nano_pearl_finished[i]
+                )
+                if token_ids:
+                    req.output_ids.extend(token_ids)
+                    new_accepted_len = len(token_ids)
+                    if stream_reqs is not None:
+                        stream_reqs.append(req)
+                elif not force_finish:
                     continue
-                req.output_ids.extend(token_ids)
-                new_accepted_len = len(token_ids)
-                if stream_reqs is not None:
-                    stream_reqs.append(req)
+                else:
+                    new_accepted_len = 0
+                    if not req.finished():
+                        if req.output_ids:
+                            last_token = req.output_ids[-1]
+                            eos_ids = set()
+                            if req.eos_token_ids:
+                                eos_ids |= req.eos_token_ids
+                            model_eos_ids = self.model_config.hf_eos_token_id or set()
+                            eos_ids |= model_eos_ids
+                            if eos_ids and last_token in eos_ids:
+                                req.finished_reason = FINISH_MATCHED_TOKEN(
+                                    matched=last_token
+                                )
+                            else:
+                                req.finished_reason = FINISH_LENGTH(
+                                    length=len(req.output_ids)
+                                )
+                                req.finished_len = len(req.output_ids)
+                        else:
+                            req.finished_reason = FINISH_LENGTH(length=0)
+                            req.finished_len = 0
             elif batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_eagle_v2:
@@ -517,10 +548,14 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
+            has_tokens = not use_nano_pearl or bool(token_ids)
 
-            req.check_finished(new_accepted_len)
+            # Update Mamba last track seqlen
+            if has_tokens:
+                self._mamba_prefix_cache_update(req, batch, result, i)
+
+            if has_tokens:
+                req.check_finished(new_accepted_len)
 
             if use_nano_pearl and extra_token_counts is not None:
                 extra_tokens = extra_token_counts[i]
@@ -539,10 +574,9 @@ class SchedulerOutputProcessorMixin:
                             req.kv_committed_len,
                             expected_len,
                         )
-                        if req.kv_committed_len < expected_len:
-                            req.fill_ids = req.fill_ids[: req.kv_committed_len]
-                        else:
-                            req.kv_committed_len = expected_len
+                        req.kv_committed_len = expected_len
+                        if req.kv_allocated_len < req.kv_committed_len:
+                            req.kv_allocated_len = req.kv_committed_len
                     if req.kv_allocated_len > req.kv_committed_len:
                         tail_indices = self.req_to_token_pool.req_to_token[
                             req.req_pool_idx,
@@ -568,7 +602,7 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
+            if has_tokens and req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -587,12 +621,16 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if (
+                has_tokens
+                and req.return_hidden_states
+                and logits_output.hidden_states is not None
+            ):
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None:
+            if has_tokens and req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if use_nano_pearl and token_ids:

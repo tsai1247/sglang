@@ -50,6 +50,7 @@ class GenerationBatchResult:
 
     # nano-pearl: optional token chunks per request
     nano_pearl_output_ids: Optional[List[List[int]]] = None
+    nano_pearl_finished: Optional[List[bool]] = None
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
