@@ -26,7 +26,7 @@ python -m sglang.launch_server \
 ### nano-PEARL API 補強
 - `python/nano-PEARL/nano_pearl/pearl_engine/pearl_engine.py`
   - `add_request()` 回傳 `seq_id` 以便外部對應 req。
-  - 新增 `generate_tokens()` 回傳 raw token ids，供 sglang 對接。
+  - 新增 `stream_generate_step()` 回傳單步 token chunk，供 sglang 逐步整合。
 
 ### TpModelWorker 對接 PEARLEngine
 - `python/sglang/srt/managers/tp_worker.py`
@@ -46,14 +46,16 @@ python -m sglang.launch_server \
 - `python/nano-PEARL/nano_pearl/pearl_engine/pearl_engine.py`
   - 新增 `stream_generate()` 介面，搭配 shared memory 回傳 chunk。
 - `python/sglang/srt/managers/tp_worker.py`
-  - 在 `stream=true` 時走 `stream_generate` 串流流程，逐步提供 token 給 Scheduler。
+  - worker thread 呼叫 `stream_generate_step()` 單步推進，逐步提供 token 給 Scheduler。
 
 ## 效能優化（與 sglang 排程整合）
 - `python/sglang/srt/managers/tp_worker.py`
-  - 新增常駐 worker thread 驅動 `stream_generate()`，新請求改為排隊送入，不再在主 thread 直接呼叫 `generate_tokens()`。
-  - streaming / non-streaming 共用同一套 token 佇列機制；prefill / decode 先維持單 token 回填給 Scheduler。
+  - 常駐 worker thread 以 `stream_generate_step()` 單步推進，並在每步之間插入新請求，降低批次鎖死造成的等待。
+  - streaming / non-streaming 共用同一套 token 佇列機制；prefill 維持單 token 回填，non-stream decode 在完成後可一次回填剩餘 tokens。
   - `next_token_ids` 使用 CPU tensor，避免 GPU/CPU 同步往返成本。
   - 新增 `NANO_PEARL_SGLANG_WAIT_TIMEOUT_S` 等待上限，避免卡死時無限阻塞。
+ - `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
+   - nano-pearl decode 支援一次回填多 token 時，額外分配 KV 索引並同步更新 seq_len 與 KV 統計，避免記憶體帳務錯亂。
 
 ## 已修正的錯誤
 - `world group is not initialized`
@@ -73,12 +75,12 @@ python -m sglang.launch_server \
   - `max_new_tokens`
   - `ignore_eos`
 - `top_p` / `top_k` 會被忽略（會提示 warning）。
-- nano-PEARL streaming 目前仍是以整個 batch 為單位同步推進，新增請求需等待上一批完成。
+- nano-PEARL streaming 目前以單步推進，仍無法在單次步驟內插入新請求，但可在步與步之間加入。
 
 ## 行為與流程摘要
 1. `--enable-nano-pearl` 會觸發 PEARLEngine 初始化。
 2. Scheduler 進入 decode 後，TpModelWorker 將 req 送入 nano-pearl worker 佇列。
-3. worker 以 `stream_generate()` 產生 token chunk，回填到 token 佇列。
+3. worker 以 `stream_generate_step()` 單步產生 token chunk，回填到 token 佇列。
 4. Scheduler 從佇列取出 `next_token_ids`，回傳給後續處理；`stream=true` 逐步回傳 chunk。
 
 ## 後續可能需要處理的方向

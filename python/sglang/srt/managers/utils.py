@@ -48,6 +48,9 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    # nano-pearl: optional token chunks per request
+    nano_pearl_output_ids: Optional[List[List[int]]] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

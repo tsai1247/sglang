@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import alloc_token_slots, release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -338,6 +338,7 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        nano_pearl_output_ids = result.nano_pearl_output_ids
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -345,7 +346,27 @@ class SchedulerOutputProcessorMixin:
         elif batch.is_eagle_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
+        use_nano_pearl = (
+            nano_pearl_output_ids is not None and batch.spec_algorithm.is_none()
+        )
+        extra_token_counts = None
+        extra_cache_loc = None
+        extra_offset = 0
+        extra_total = 0
+        if use_nano_pearl:
+            extra_token_counts = [
+                max(len(token_ids) - 1, 0) if token_ids else 0
+                for token_ids in nano_pearl_output_ids
+            ]
+            extra_total = sum(extra_token_counts)
+            if extra_total > 0:
+                extra_cache_loc = alloc_token_slots(self.tree_cache, extra_total)
+                extra_cache_loc = extra_cache_loc.to(torch.int32)
+
+        if use_nano_pearl:
+            self.num_generated_tokens += len(batch.reqs) + extra_total
+        else:
+            self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
@@ -367,7 +388,11 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if use_nano_pearl and nano_pearl_output_ids[i]:
+                accepted_ids = nano_pearl_output_ids[i]
+                req.output_ids.extend(accepted_ids)
+                new_accepted_len = len(accepted_ids)
+            elif batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_eagle_v2:
                 # Only v2 eagle's output_ids are updated here.
@@ -379,7 +404,47 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
 
+            if use_nano_pearl and extra_token_counts is not None:
+                extra_tokens = extra_token_counts[i]
+                if extra_tokens:
+                    if extra_cache_loc is None:
+                        raise RuntimeError(
+                            "nano-pearl extra cache allocation is missing."
+                        )
+                    base = req.kv_committed_len
+                    positions = torch.arange(
+                        base,
+                        base + extra_tokens,
+                        device=batch.device,
+                        dtype=torch.int64,
+                    )
+                    req_indices = torch.full(
+                        (extra_tokens,),
+                        req.req_pool_idx,
+                        device=batch.device,
+                        dtype=torch.int64,
+                    )
+                    loc_slice = extra_cache_loc[
+                        extra_offset : extra_offset + extra_tokens
+                    ]
+                    extra_offset += extra_tokens
+                    batch.req_to_token_pool.write(
+                        (req_indices, positions), loc_slice
+                    )
+                    if batch.seq_lens is not None:
+                        batch.seq_lens[i] += extra_tokens
+                    if batch.seq_lens_cpu is not None:
+                        batch.seq_lens_cpu[i] += extra_tokens
+                    if batch.orig_seq_lens is not None:
+                        batch.orig_seq_lens[i] += extra_tokens
+                    if batch.seq_lens_sum is not None:
+                        batch.seq_lens_sum += extra_tokens
+                    req.kv_committed_len += extra_tokens
+                    req.kv_allocated_len += extra_tokens
+
             if req.finished():
+                if use_nano_pearl:
+                    req.fill_ids = req.origin_input_ids + req.output_ids
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -418,7 +483,10 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if use_nano_pearl and nano_pearl_output_ids[i]:
+                        for token_id in nano_pearl_output_ids[i]:
+                            req.grammar.accept_token(token_id)
+                    elif batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_eagle_v2:
