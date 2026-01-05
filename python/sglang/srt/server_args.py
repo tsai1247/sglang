@@ -275,6 +275,9 @@ class ServerArgs:
     draft_model_tp_size: int = 1
     nano_pearl_share_gpus: bool = False
     nano_pearl_target_tp_size: Optional[int] = None
+    nano_pearl_max_num_batched_tokens: Optional[int] = None
+    nano_pearl_max_num_seqs: Optional[int] = None
+    nano_pearl_gpu_memory_utilization: Optional[float] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -2492,6 +2495,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.nano_pearl_target_tp_size,
             help="Target TP size used by nano-pearl engine (keep --tensor-parallel-size=1).",
+        )
+        parser.add_argument(
+            "--nano-pearl-max-num-batched-tokens",
+            type=int,
+            default=ServerArgs.nano_pearl_max_num_batched_tokens,
+            help="Override nano-pearl max_num_batched_tokens.",
+        )
+        parser.add_argument(
+            "--nano-pearl-max-num-seqs",
+            type=int,
+            default=ServerArgs.nano_pearl_max_num_seqs,
+            help="Override nano-pearl max_num_seqs.",
+        )
+        parser.add_argument(
+            "--nano-pearl-gpu-memory-utilization",
+            type=float,
+            default=ServerArgs.nano_pearl_gpu_memory_utilization,
+            help="Override nano-pearl gpu_memory_utilization.",
         )
 
         parser.add_argument(

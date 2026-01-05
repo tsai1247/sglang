@@ -784,11 +784,16 @@ class TpModelWorker(BaseTpWorker):
             )
 
         max_num_batched_tokens = (
-            server_args.max_total_tokens
+            server_args.nano_pearl_max_num_batched_tokens
+            or server_args.max_total_tokens
             or server_args.max_prefill_tokens
             or 16384
         )
-        max_num_seqs = server_args.max_running_requests or 512
+        max_num_seqs = (
+            server_args.nano_pearl_max_num_seqs
+            or server_args.max_running_requests
+            or 512
+        )
         max_model_len = self.model_config.context_len
 
         if max_num_batched_tokens < max_model_len:
@@ -803,6 +808,28 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_max_num_batched_tokens = max_num_batched_tokens
         self._nano_pearl_max_num_seqs = max_num_seqs
 
+        if (
+            server_args.nano_pearl_share_gpus
+            and server_args.nano_pearl_max_num_batched_tokens is None
+            and server_args.max_total_tokens is None
+            and server_args.max_prefill_tokens == 16384
+        ):
+            logger.warning(
+                "nano-pearl share-gpus with default max_num_batched_tokens=16384 "
+                "can be too large; lowering to 8192."
+            )
+            max_num_batched_tokens = 8192
+
+        gpu_memory_utilization = (
+            server_args.nano_pearl_gpu_memory_utilization
+            if server_args.nano_pearl_gpu_memory_utilization is not None
+            else (
+                server_args.mem_fraction_static
+                if server_args.mem_fraction_static is not None
+                else 0.9
+            )
+        )
+
         config = PEARLConfig(
             server_args.speculative_draft_model_path,
             server_args.model_path,
@@ -812,11 +839,7 @@ class TpModelWorker(BaseTpWorker):
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
-            gpu_memory_utilization=(
-                server_args.mem_fraction_static
-                if server_args.mem_fraction_static is not None
-                else 0.9
-            ),
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         self.pearl_engine = PEARLEngine(config)
         self._nano_pearl_sampling_cls = SamplingParams

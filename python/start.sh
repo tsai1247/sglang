@@ -13,5 +13,7 @@ python -m sglang.launch_server \
   --nano-pearl-target-tp-size 2 \
   --draft-model-tp-size 2 \
   --tensor-parallel-size 1 \
-  --port 12470 \
-  --mem-fraction-static 0.95
+  --nano-pearl-max-num-batched-tokens 8192 \
+  --nano-pearl-max-num-seqs 64 \
+  --nano-pearl-gpu-memory-utilization 0.95 \
+  --port 12470
