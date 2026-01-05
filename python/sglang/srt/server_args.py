@@ -273,6 +273,7 @@ class ServerArgs:
     enable_nano_pearl: bool = False
     draft_model_path: Optional[str] = None
     draft_model_tp_size: int = 1
+    nano_pearl_target_tp_size: Optional[int] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -1965,6 +1966,12 @@ class ServerArgs:
             )
             self.page_size = 1
 
+        if not self.disable_overlap_schedule:
+            logger.warning(
+                "nano-pearl mode disables overlap schedule for stability."
+            )
+        self.disable_overlap_schedule = True
+
     def _handle_speculative_decoding(self):
         if (
             self.speculative_draft_model_path is not None
@@ -2470,6 +2477,12 @@ class ServerArgs:
             type=int,
             default=1,
             help="The tensor parallel size of draft model. Required when --enable-nano-pearl is set.",
+        )
+        parser.add_argument(
+            "--nano-pearl-target-tp-size",
+            type=int,
+            default=ServerArgs.nano_pearl_target_tp_size,
+            help="Target TP size used by nano-pearl engine (keep --tensor-parallel-size=1).",
         )
 
         parser.add_argument(

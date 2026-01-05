@@ -1987,7 +1987,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+        if self.output_ids is not None:
+            if self.output_ids.is_cpu:
+                self.output_ids = self.output_ids[keep_indices]
+            else:
+                self.output_ids = self.output_ids[keep_indices_device]
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None

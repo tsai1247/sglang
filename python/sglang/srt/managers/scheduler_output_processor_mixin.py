@@ -390,7 +390,12 @@ class SchedulerOutputProcessorMixin:
                 if out_cache_loc.numel() > 0:
                     self.token_to_kv_pool_allocator.free(out_cache_loc)
                 if batch.seq_lens_cpu is not None:
-                    positions = batch.seq_lens_cpu[rollback_indices] - 1
+                    cpu_indices = torch.tensor(
+                        no_token_indices, device="cpu", dtype=torch.long
+                    )
+                    positions = (
+                        batch.seq_lens_cpu[cpu_indices] - 1
+                    ).to(batch.device, dtype=torch.int64)
                 else:
                     positions = batch.seq_lens[rollback_indices] - 1
                 req_indices = torch.tensor(
@@ -405,7 +410,7 @@ class SchedulerOutputProcessorMixin:
                 if batch.seq_lens is not None:
                     batch.seq_lens[rollback_indices] -= 1
                 if batch.seq_lens_cpu is not None:
-                    batch.seq_lens_cpu[rollback_indices] -= 1
+                    batch.seq_lens_cpu[cpu_indices] -= 1
                 if batch.orig_seq_lens is not None:
                     batch.orig_seq_lens[rollback_indices] -= 1
                 if batch.seq_lens_sum is not None:
