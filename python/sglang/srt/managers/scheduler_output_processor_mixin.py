@@ -623,9 +623,27 @@ class SchedulerOutputProcessorMixin:
         missing_count = missing_positions.numel()
         if missing_count == 0:
             return
-        new_cache_loc = alloc_token_slots(self.tree_cache, missing_count).to(
-            torch.int32
-        )
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+        available = allocator.available_size()
+        if available < missing_count:
+            logger.warning(
+                "nano-pearl skipping KV sanitize for %s: need=%d available=%d",
+                req.rid,
+                missing_count,
+                available,
+            )
+            return
+        try:
+            new_cache_loc = alloc_token_slots(
+                self.tree_cache, missing_count
+            ).to(torch.int32)
+        except RuntimeError as exc:
+            logger.warning(
+                "nano-pearl KV sanitize alloc failed for %s: %s",
+                req.rid,
+                exc,
+            )
+            return
         req_indices = torch.full(
             (missing_count,),
             req.req_pool_idx,

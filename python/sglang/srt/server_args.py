@@ -1966,11 +1966,21 @@ class ServerArgs:
             )
             self.page_size = 1
 
-        if not self.disable_overlap_schedule:
+        allow_overlap = os.getenv("SGLANG_NANO_PEARL_ALLOW_OVERLAP", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if allow_overlap:
             logger.warning(
-                "nano-pearl mode disables overlap schedule for stability."
+                "nano-pearl mode keeps overlap schedule enabled via SGLANG_NANO_PEARL_ALLOW_OVERLAP."
             )
-        self.disable_overlap_schedule = True
+        else:
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "nano-pearl mode disables overlap schedule for stability."
+                )
+            self.disable_overlap_schedule = True
 
     def _handle_speculative_decoding(self):
         if (

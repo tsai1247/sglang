@@ -460,6 +460,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
+        self.server_args = server_args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
@@ -770,7 +771,15 @@ class TpModelWorker(BaseTpWorker):
                     if state is not None and state.done:
                         self._nano_pearl_active.pop(req.rid, None)
 
-        next_token_ids_tensor = torch.tensor(next_token_ids, dtype=torch.long)
+        next_token_device = torch.device("cpu")
+        if not self.server_args.disable_overlap_schedule:
+            if model_worker_batch.input_ids is not None:
+                next_token_device = model_worker_batch.input_ids.device
+            else:
+                next_token_device = torch.device(self.device)
+        next_token_ids_tensor = torch.tensor(
+            next_token_ids, dtype=torch.long, device=next_token_device
+        )
         logits_output = LogitsProcessorOutput(next_token_logits=None)
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -826,6 +835,16 @@ class TpModelWorker(BaseTpWorker):
 
         self._nano_pearl_max_num_batched_tokens = max_num_batched_tokens
         self._nano_pearl_max_num_seqs = max_num_seqs
+        gamma_env = os.getenv("NANO_PEARL_GAMMA")
+        if gamma_env:
+            try:
+                gamma = int(gamma_env)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid NANO_PEARL_GAMMA value: {gamma_env}"
+                ) from exc
+        else:
+            gamma = -1
         config = PEARLConfig(
             server_args.speculative_draft_model_path,
             server_args.model_path,
@@ -840,6 +859,7 @@ class TpModelWorker(BaseTpWorker):
                 if server_args.mem_fraction_static is not None
                 else 0.9
             ),
+            gamma=gamma,
         )
         self.pearl_engine = PEARLEngine(config)
         self._nano_pearl_sampling_cls = SamplingParams
