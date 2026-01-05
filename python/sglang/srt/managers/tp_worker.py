@@ -1028,9 +1028,14 @@ class TpModelWorker(BaseTpWorker):
                                     if self._nano_pearl_request_queue:
                                         steps = 1
                                 with self._nano_pearl_lock:
-                                    step_output, step_done = (
+                                    step_result = (
                                         self.pearl_engine.stream_generate_steps(steps)
                                     )
+                                if isinstance(step_result, tuple) and len(step_result) == 3:
+                                    step_output, step_done, finished_ids = step_result
+                                else:
+                                    step_output, step_done = step_result
+                                    finished_ids = []
                                 with self._nano_pearl_cv:
                                     for seq_id, token_ids in step_output:
                                         rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
@@ -1039,6 +1044,15 @@ class TpModelWorker(BaseTpWorker):
                                         self._nano_pearl_pending_tokens.setdefault(
                                             rid, deque()
                                         ).extend(token_ids)
+                                    for seq_id in finished_ids:
+                                        rid = self._nano_pearl_seq_id_to_rid.pop(
+                                            seq_id, None
+                                        )
+                                        if rid is None:
+                                            continue
+                                        state = self._nano_pearl_active.get(rid)
+                                        if state is not None:
+                                            state.done = True
                                     if step_done:
                                         for rid in list(self._nano_pearl_active):
                                             state = self._nano_pearl_active.get(rid)
@@ -1052,9 +1066,14 @@ class TpModelWorker(BaseTpWorker):
                         else:
                             for _ in range(self._nano_pearl_prefetch_steps):
                                 with self._nano_pearl_lock:
-                                    step_output, step_done = (
+                                    step_result = (
                                         self.pearl_engine.stream_generate_step()
                                     )
+                                if isinstance(step_result, tuple) and len(step_result) == 3:
+                                    step_output, step_done, finished_ids = step_result
+                                else:
+                                    step_output, step_done = step_result
+                                    finished_ids = []
                                 with self._nano_pearl_cv:
                                     for seq_id, token_ids in step_output:
                                         rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
@@ -1063,6 +1082,15 @@ class TpModelWorker(BaseTpWorker):
                                         self._nano_pearl_pending_tokens.setdefault(
                                             rid, deque()
                                         ).extend(token_ids)
+                                    for seq_id in finished_ids:
+                                        rid = self._nano_pearl_seq_id_to_rid.pop(
+                                            seq_id, None
+                                        )
+                                        if rid is None:
+                                            continue
+                                        state = self._nano_pearl_active.get(rid)
+                                        if state is not None:
+                                            state.done = True
                                     if step_done:
                                         for rid in list(self._nano_pearl_active):
                                             state = self._nano_pearl_active.get(rid)
@@ -1244,7 +1272,12 @@ class TpModelWorker(BaseTpWorker):
         if not self._nano_pearl_lock.acquire(blocking=False):
             return False
         try:
-            step_output, step_done = self.pearl_engine.stream_generate_step()
+            step_result = self.pearl_engine.stream_generate_step()
+            if isinstance(step_result, tuple) and len(step_result) == 3:
+                step_output, step_done, finished_ids = step_result
+            else:
+                step_output, step_done = step_result
+                finished_ids = []
         except Exception as exc:
             logger.warning("nano-pearl kick failed: %s", exc)
             return False
@@ -1258,6 +1291,13 @@ class TpModelWorker(BaseTpWorker):
                 self._nano_pearl_pending_tokens.setdefault(
                     rid, deque()
                 ).extend(token_ids)
+            for seq_id in finished_ids:
+                rid = self._nano_pearl_seq_id_to_rid.pop(seq_id, None)
+                if rid is None:
+                    continue
+                state = self._nano_pearl_active.get(rid)
+                if state is not None:
+                    state.done = True
             if step_done:
                 for rid in list(self._nano_pearl_active):
                     state = self._nano_pearl_active.get(rid)
