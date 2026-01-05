@@ -14,11 +14,5 @@ python -m sglang.launch_server \
   --draft-model-path ~/models/Qwen/Qwen3-1.7B \
   --draft-model-tp-size 1 \
   --tensor-parallel-size 1 \
-  --nano-pearl-max-num-batched-tokens 10240 \
-  --nano-pearl-max-num-seqs 8 \
-  --nano-pearl-gpu-memory-utilization 0.92 \
-  --nano-pearl-gamma 2 \
-  --mem-fraction-static 0.92 \
-  --stream-interval 16 \
-  --schedule-conservativeness 0.6 \
-  --port 12470
+  --port 12470 \
+  --mem-fraction-static 0.95
