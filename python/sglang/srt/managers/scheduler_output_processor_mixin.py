@@ -349,14 +349,27 @@ class SchedulerOutputProcessorMixin:
         use_nano_pearl = (
             nano_pearl_output_ids is not None and batch.spec_algorithm.is_none()
         )
+        per_req_token_ids = None
         extra_token_counts = None
         extra_cache_loc = None
         extra_offset = 0
         extra_total = 0
         if use_nano_pearl:
+            per_req_token_ids = []
+            generated_tokens = 0
+            for token_ids, next_token_id in zip(
+                nano_pearl_output_ids, next_token_ids
+            ):
+                if token_ids:
+                    per_req_token_ids.append(token_ids)
+                    generated_tokens += len(token_ids)
+                elif next_token_id >= 0:
+                    per_req_token_ids.append([next_token_id])
+                    generated_tokens += 1
+                else:
+                    per_req_token_ids.append([])
             extra_token_counts = [
-                max(len(token_ids) - 1, 0) if token_ids else 0
-                for token_ids in nano_pearl_output_ids
+                max(len(token_ids) - 1, 0) for token_ids in per_req_token_ids
             ]
             extra_total = sum(extra_token_counts)
             if extra_total > 0:
@@ -364,7 +377,7 @@ class SchedulerOutputProcessorMixin:
                 extra_cache_loc = extra_cache_loc.to(torch.int32)
 
         if use_nano_pearl:
-            self.num_generated_tokens += len(batch.reqs) + extra_total
+            self.num_generated_tokens += generated_tokens
         else:
             self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -387,11 +400,16 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            token_ids = None
             new_accepted_len = 1
-            if use_nano_pearl and nano_pearl_output_ids[i]:
-                accepted_ids = nano_pearl_output_ids[i]
-                req.output_ids.extend(accepted_ids)
-                new_accepted_len = len(accepted_ids)
+            if use_nano_pearl:
+                if per_req_token_ids is None:
+                    raise RuntimeError("nano-pearl token list is missing.")
+                token_ids = per_req_token_ids[i]
+                if not token_ids:
+                    continue
+                req.output_ids.extend(token_ids)
+                new_accepted_len = len(token_ids)
             elif batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_eagle_v2:
@@ -472,9 +490,13 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req, self.tree_cache, is_insert=not use_nano_pearl
+                        )
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(
+                        req, self.tree_cache, is_insert=not use_nano_pearl
+                    )
 
                 req.time_stats.completion_time = time.perf_counter()
 
@@ -505,8 +527,8 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if use_nano_pearl and nano_pearl_output_ids[i]:
-                        for token_id in nano_pearl_output_ids[i]:
+                    if use_nano_pearl and token_ids:
+                        for token_id in token_ids:
                             req.grammar.accept_token(token_id)
                     elif batch.spec_algorithm.is_none():
                         # Normal decode: single token

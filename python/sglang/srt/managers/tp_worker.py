@@ -717,7 +717,19 @@ class TpModelWorker(BaseTpWorker):
                 token_queue = self._nano_pearl_pending_tokens.get(req.rid)
                 state = self._nano_pearl_active.get(req.rid)
 
-                if stream_error is not None or not token_queue:
+                if stream_error is not None:
+                    token_id = self._nano_pearl_fallback_token(req)
+                    next_token_ids.append(token_id)
+                    nano_pearl_output_ids.append([])
+                    if state is not None and state.done:
+                        self._nano_pearl_active.pop(req.rid, None)
+                    continue
+                if not token_queue:
+                    if state is None or not state.done:
+                        # -1 means no token yet; scheduler should skip update.
+                        next_token_ids.append(-1)
+                        nano_pearl_output_ids.append([])
+                        continue
                     token_id = self._nano_pearl_fallback_token(req)
                     next_token_ids.append(token_id)
                     nano_pearl_output_ids.append([])
@@ -1017,20 +1029,19 @@ class TpModelWorker(BaseTpWorker):
             while True:
                 if self._nano_pearl_stream_error is not None:
                     return
-                all_ready = True
+                any_ready = False
                 for req in reqs:
                     token_queue = self._nano_pearl_pending_tokens.get(req.rid)
                     state = self._nano_pearl_active.get(req.rid)
                     if token_queue:
+                        any_ready = True
                         continue
                     if state is None:
-                        all_ready = False
-                        break
-                    if state.done:
                         continue
-                    all_ready = False
-                    break
-                if all_ready:
+                    if state.done:
+                        any_ready = True
+                        continue
+                if any_ready:
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
