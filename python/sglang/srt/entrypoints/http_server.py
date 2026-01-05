@@ -1556,6 +1556,41 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
+        if (
+            server_args.enable_nano_pearl
+            and server_args.disaggregation_mode == "null"
+            and request_name == "/generate"
+        ):
+            json_data["sampling_params"]["top_p"] = 1.0
+            json_data["sampling_params"]["top_k"] = -1
+            json_data["stream"] = True
+            res = requests.post(
+                url + request_name,
+                json=json_data,
+                headers=headers,
+                stream=True,
+                timeout=warmup_timeout if warmup_timeout > 0 else 60,
+            )
+            res.raise_for_status()
+            ready = False
+            for line in res.iter_lines():
+                if not line:
+                    continue
+                if line.startswith(b"data: "):
+                    payload = line[len(b"data: ") :]
+                    if payload == b"[DONE]":
+                        ready = True
+                        break
+                    ready = True
+                    break
+            res.close()
+            if not ready:
+                logger.warning(
+                    "nano-pearl warmup did not return tokens; continuing startup."
+                )
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            return True
+
         if server_args.disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,

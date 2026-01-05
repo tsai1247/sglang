@@ -350,12 +350,14 @@ class SchedulerOutputProcessorMixin:
             nano_pearl_output_ids is not None and batch.spec_algorithm.is_none()
         )
         per_req_token_ids = None
+        stream_reqs = None
         extra_token_counts = None
         extra_cache_loc = None
         extra_offset = 0
         extra_total = 0
         if use_nano_pearl:
             per_req_token_ids = []
+            stream_reqs = []
             generated_tokens = 0
             for token_ids, next_token_id in zip(
                 nano_pearl_output_ids, next_token_ids
@@ -390,7 +392,7 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
-        # Check finish condition
+            # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
@@ -410,6 +412,8 @@ class SchedulerOutputProcessorMixin:
                     continue
                 req.output_ids.extend(token_ids)
                 new_accepted_len = len(token_ids)
+                if stream_reqs is not None:
+                    stream_reqs.append(req)
             elif batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_eagle_v2:
@@ -546,7 +550,11 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+        if use_nano_pearl:
+            if stream_reqs:
+                self.stream_output(stream_reqs, batch.return_logprob)
+        else:
+            self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)

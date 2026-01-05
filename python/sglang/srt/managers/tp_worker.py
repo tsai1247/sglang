@@ -512,6 +512,13 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_wait_timeout_s = float(
             os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_S", "5")
         )
+        self._nano_pearl_stream_wait_timeout_s = float(
+            os.getenv("NANO_PEARL_SGLANG_STREAM_WAIT_TIMEOUT_S", "1")
+        )
+        self._nano_pearl_last_wait_warn_ts = 0.0
+        self._nano_pearl_prefetch_steps = max(
+            int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_STEPS", "2")), 1
+        )
 
         if self.use_pearl_engine:
             self._init_pearl_engine(server_args)
@@ -713,6 +720,11 @@ class TpModelWorker(BaseTpWorker):
         nano_pearl_output_ids: List[List[int]] = []
         with self._nano_pearl_cv:
             stream_error = self._nano_pearl_stream_error
+            no_engine_active = (
+                not self._nano_pearl_request_queue
+                and not self._nano_pearl_seq_id_to_rid
+                and not self._nano_pearl_active
+            )
             for req in model_worker_batch.reqs:
                 token_queue = self._nano_pearl_pending_tokens.get(req.rid)
                 state = self._nano_pearl_active.get(req.rid)
@@ -726,9 +738,14 @@ class TpModelWorker(BaseTpWorker):
                     continue
                 if not token_queue:
                     if state is None or not state.done:
-                        # -1 means no token yet; scheduler should skip update.
-                        next_token_ids.append(-1)
-                        nano_pearl_output_ids.append([])
+                        if no_engine_active:
+                            token_id = self._nano_pearl_fallback_token(req)
+                            next_token_ids.append(token_id)
+                            nano_pearl_output_ids.append([])
+                        else:
+                            # -1 means no token yet; scheduler should skip update.
+                            next_token_ids.append(-1)
+                            nano_pearl_output_ids.append([])
                         continue
                     token_id = self._nano_pearl_fallback_token(req)
                     next_token_ids.append(token_id)
@@ -959,18 +976,29 @@ class TpModelWorker(BaseTpWorker):
                         if not has_active and not has_pending:
                             break
 
-                        with self._nano_pearl_lock:
-                            output, done = (
-                                self.pearl_engine.stream_generate_step()
-                            )
+                        outputs = []
+                        done = False
+                        for _ in range(self._nano_pearl_prefetch_steps):
+                            with self._nano_pearl_lock:
+                                step_output, step_done = (
+                                    self.pearl_engine.stream_generate_step()
+                                )
+                            outputs.append(step_output)
+                            if step_done:
+                                done = True
+                                break
+                            with self._nano_pearl_cv:
+                                if self._nano_pearl_request_queue:
+                                    break
                         with self._nano_pearl_cv:
-                            for seq_id, token_ids in output:
-                                rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
-                                if rid is None:
-                                    continue
-                                self._nano_pearl_pending_tokens.setdefault(
-                                    rid, deque()
-                                ).extend(token_ids)
+                            for output in outputs:
+                                for seq_id, token_ids in output:
+                                    rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                                    if rid is None:
+                                        continue
+                                    self._nano_pearl_pending_tokens.setdefault(
+                                        rid, deque()
+                                    ).extend(token_ids)
                             if done:
                                 for rid in list(self._nano_pearl_active):
                                     state = self._nano_pearl_active.get(rid)
@@ -1024,7 +1052,10 @@ class TpModelWorker(BaseTpWorker):
             self._nano_pearl_cv.notify_all()
 
     def _nano_pearl_wait_for_tokens(self, reqs):
-        deadline = time.monotonic() + self._nano_pearl_wait_timeout_s
+        timeout = self._nano_pearl_wait_timeout_s
+        if any(req.stream for req in reqs):
+            timeout = min(timeout, self._nano_pearl_stream_wait_timeout_s)
+        deadline = time.monotonic() + timeout
         with self._nano_pearl_cv:
             while True:
                 if self._nano_pearl_stream_error is not None:
@@ -1045,6 +1076,16 @@ class TpModelWorker(BaseTpWorker):
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if timeout > 0:
+                        now = time.monotonic()
+                        if now - self._nano_pearl_last_wait_warn_ts > 5:
+                            self._nano_pearl_last_wait_warn_ts = now
+                            logger.warning(
+                                "nano-pearl wait timeout (%.2fs). pending=%d active=%d",
+                                timeout,
+                                len(self._nano_pearl_request_queue),
+                                len(self._nano_pearl_seq_id_to_rid),
+                            )
                     return
                 self._nano_pearl_cv.wait(timeout=min(0.05, remaining))
 
