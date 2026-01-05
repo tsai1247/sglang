@@ -51,11 +51,9 @@ python -m sglang.launch_server \
 ## 效能優化（與 sglang 排程整合）
 - `python/sglang/srt/managers/tp_worker.py`
   - 新增常駐 worker thread 驅動 `stream_generate()`，新請求改為排隊送入，不再在主 thread 直接呼叫 `generate_tokens()`。
-  - streaming / non-streaming 共用同一套 token 佇列機制；prefill 階段只餵單 token，decode 階段可一次回填多 token。
-  - `next_token_ids` 改回 CPU tensor，避免 GPU/CPU 同步往返成本。
+  - streaming / non-streaming 共用同一套 token 佇列機制；prefill / decode 先維持單 token 回填給 Scheduler。
+  - `next_token_ids` 使用 CPU tensor，避免 GPU/CPU 同步往返成本。
   - 新增 `NANO_PEARL_SGLANG_WAIT_TIMEOUT_S` 等待上限，避免卡死時無限阻塞。
-- `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
-  - decode 階段補齊 nano-pearl 多 token 接受時的 KV 長度統計。
 
 ## 已修正的錯誤
 - `world group is not initialized`

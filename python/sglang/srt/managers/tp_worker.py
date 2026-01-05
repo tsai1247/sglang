@@ -707,9 +707,7 @@ class TpModelWorker(BaseTpWorker):
 
         self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
 
-        is_prefill = model_worker_batch.forward_mode.is_extend()
         next_token_ids: List[int] = []
-        nano_pearl_output_ids: List[List[int]] = []
         with self._nano_pearl_cv:
             stream_error = self._nano_pearl_stream_error
             for req in model_worker_batch.reqs:
@@ -719,30 +717,12 @@ class TpModelWorker(BaseTpWorker):
                 if stream_error is not None or not token_queue:
                     token_id = self._nano_pearl_fallback_token(req)
                     next_token_ids.append(token_id)
-                    if req.stream:
-                        nano_pearl_output_ids.append([])
-                    else:
-                        nano_pearl_output_ids.append([token_id])
                     if state is not None and state.done:
                         self._nano_pearl_active.pop(req.rid, None)
                     continue
 
-                if req.stream:
-                    token_id = token_queue.popleft()
-                    next_token_ids.append(token_id)
-                    nano_pearl_output_ids.append([])
-                else:
-                    if state is not None and state.done and not is_prefill:
-                        token_ids = list(token_queue)
-                        token_queue.clear()
-                        if not token_ids:
-                            token_ids = [self._nano_pearl_fallback_token(req)]
-                        next_token_ids.append(token_ids[-1])
-                        nano_pearl_output_ids.append(token_ids)
-                    else:
-                        token_id = token_queue.popleft()
-                        next_token_ids.append(token_id)
-                        nano_pearl_output_ids.append([])
+                token_id = token_queue.popleft()
+                next_token_ids.append(token_id)
 
                 if token_queue is not None and not token_queue:
                     self._nano_pearl_pending_tokens.pop(req.rid, None)
@@ -755,7 +735,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids_tensor,
             can_run_cuda_graph=False,
-            nano_pearl_output_ids=nano_pearl_output_ids,
         )
 
     def _ensure_nano_pearl_importable(self):
