@@ -460,6 +460,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
+        self.server_args = server_args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
@@ -725,9 +726,17 @@ class TpModelWorker(BaseTpWorker):
                     continue
 
                 if req.stream:
-                    token_id = token_queue.popleft()
-                    next_token_ids.append(token_id)
-                    nano_pearl_output_ids.append([])
+                    stream_interval = (
+                        req.sampling_params.stream_interval
+                        or self.server_args.stream_interval
+                    )
+                    max_chunk = max(int(stream_interval), 1)
+                    take = min(len(token_queue), max_chunk)
+                    token_ids = [token_queue.popleft() for _ in range(take)]
+                    if not token_ids:
+                        token_ids = [self._nano_pearl_fallback_token(req)]
+                    next_token_ids.append(token_ids[0])
+                    nano_pearl_output_ids.append(token_ids)
                 else:
                     token_ids = list(token_queue)
                     token_queue.clear()
@@ -763,7 +772,12 @@ class TpModelWorker(BaseTpWorker):
 
         if server_args.tp_size != 1 or server_args.pp_size != 1:
             raise RuntimeError("nano-pearl engine requires tp_size=1 and pp_size=1.")
-        required_gpus = server_args.draft_model_tp_size + server_args.tp_size
+        if server_args.nano_pearl_share_gpus:
+            required_gpus = max(
+                server_args.draft_model_tp_size, server_args.tp_size
+            )
+        else:
+            required_gpus = server_args.draft_model_tp_size + server_args.tp_size
         available_gpus = torch.cuda.device_count()
         if available_gpus < required_gpus:
             raise RuntimeError(
@@ -797,6 +811,7 @@ class TpModelWorker(BaseTpWorker):
             server_args.model_path,
             draft_tensor_parallel_size=server_args.draft_model_tp_size,
             target_tensor_parallel_size=server_args.tp_size,
+            share_draft_target_gpus=server_args.nano_pearl_share_gpus,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,

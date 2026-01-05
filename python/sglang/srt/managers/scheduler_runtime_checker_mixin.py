@@ -5,6 +5,8 @@ import time
 import warnings
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -163,6 +165,32 @@ class SchedulerRuntimeCheckerMixin:
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
 
+    def _reclaim_nano_pearl_kv_leak(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        free_pages = set(allocator.free_pages.tolist())
+        if getattr(allocator, "release_pages", None) is not None:
+            free_pages.update(allocator.release_pages.tolist())
+
+        cached_pages = set()
+        try:
+            cached_values = self.tree_cache.all_values_flatten()
+        except Exception:
+            cached_values = None
+        if cached_values is not None and cached_values.numel() > 0:
+            cached_pages = set(cached_values.tolist())
+            cached_pages.discard(0)
+
+        expected_pages = set(range(1, allocator.size + 1))
+        leaked_pages = expected_pages - free_pages - cached_pages
+        if not leaked_pages:
+            return 0
+
+        leaked_tensor = torch.tensor(
+            list(leaked_pages), dtype=torch.int64, device=allocator.device
+        )
+        allocator.free(leaked_tensor)
+        return len(leaked_pages)
+
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
         ret = 0
         for req in batch.reqs:
@@ -241,6 +269,16 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
+
+        if memory_leak and getattr(self.tp_worker, "is_nano_pearl", False):
+            reclaimed = self._reclaim_nano_pearl_kv_leak()
+            if reclaimed > 0:
+                memory_leak, token_msg = self._check_radix_cache_memory()
+                if not memory_leak:
+                    logger.warning(
+                        "nano-pearl reclaimed %d leaked KV slots during idle check.",
+                        reclaimed,
+                    )
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
