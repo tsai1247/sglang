@@ -762,8 +762,19 @@ class TpModelWorker(BaseTpWorker):
         from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams
 
         if server_args.tp_size != 1 or server_args.pp_size != 1:
-            raise RuntimeError("nano-pearl engine requires tp_size=1 and pp_size=1.")
-        required_gpus = server_args.draft_model_tp_size + server_args.tp_size
+            raise RuntimeError(
+                "nano-pearl engine requires sglang tp_size=1 and pp_size=1. "
+                "Use --nano-pearl-target-tp-size to set PEARL TP."
+            )
+        target_tp_size = (
+            server_args.nano_pearl_target_tp_size or server_args.tp_size
+        )
+        if server_args.nano_pearl_share_gpus:
+            required_gpus = max(
+                server_args.draft_model_tp_size, target_tp_size
+            )
+        else:
+            required_gpus = server_args.draft_model_tp_size + target_tp_size
         available_gpus = torch.cuda.device_count()
         if available_gpus < required_gpus:
             raise RuntimeError(
@@ -796,7 +807,8 @@ class TpModelWorker(BaseTpWorker):
             server_args.speculative_draft_model_path,
             server_args.model_path,
             draft_tensor_parallel_size=server_args.draft_model_tp_size,
-            target_tensor_parallel_size=server_args.tp_size,
+            target_tensor_parallel_size=target_tp_size,
+            share_draft_target_gpus=server_args.nano_pearl_share_gpus,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,

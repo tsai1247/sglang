@@ -273,6 +273,8 @@ class ServerArgs:
     enable_nano_pearl: bool = False
     draft_model_path: Optional[str] = None
     draft_model_tp_size: int = 1
+    nano_pearl_share_gpus: bool = False
+    nano_pearl_target_tp_size: Optional[int] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -1952,10 +1954,13 @@ class ServerArgs:
 
         if (
             self.draft_model_tp_size is not None
-            and self.draft_model_tp_size != self.tp_size
+            and self.draft_model_tp_size
+            != (self.nano_pearl_target_tp_size or self.tp_size)
         ):
             logger.warning(
-                "draft-model-tp-size currently falls back to the target tp_size in nano-pearl mode."
+                "nano-pearl uses different draft/target TP sizes (draft=%s, target=%s).",
+                self.draft_model_tp_size,
+                self.nano_pearl_target_tp_size or self.tp_size,
             )
 
         if self.page_size != 1:
@@ -1964,6 +1969,12 @@ class ServerArgs:
                 self.page_size,
             )
             self.page_size = 1
+
+        if self.nano_pearl_share_gpus:
+            logger.warning(
+                "nano-pearl share-gpus enabled: draft/target will share GPU(s). "
+                "Expect higher memory pressure and possible slowdowns."
+            )
 
     def _handle_speculative_decoding(self):
         if (
@@ -2470,6 +2481,17 @@ class ServerArgs:
             type=int,
             default=1,
             help="The tensor parallel size of draft model. Required when --enable-nano-pearl is set.",
+        )
+        parser.add_argument(
+            "--nano-pearl-share-gpus",
+            action="store_true",
+            help="Allow nano-pearl draft/target to share GPU(s). Risky for memory and throughput.",
+        )
+        parser.add_argument(
+            "--nano-pearl-target-tp-size",
+            type=int,
+            default=ServerArgs.nano_pearl_target_tp_size,
+            help="Target TP size used by nano-pearl engine (keep --tensor-parallel-size=1).",
         )
 
         parser.add_argument(
