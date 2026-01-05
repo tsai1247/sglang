@@ -519,6 +519,10 @@ class TpModelWorker(BaseTpWorker):
             os.getenv("NANO_PEARL_SGLANG_STREAM_WAIT_TIMEOUT_S", "1")
         )
         self._nano_pearl_last_wait_warn_ts = 0.0
+        self._nano_pearl_wait_timeout_limit = max(
+            int(os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_LIMIT", "3")), 0
+        )
+        self._nano_pearl_wait_timeout_hits = 0
         self._nano_pearl_prefetch_steps = max(
             int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_STEPS", "2")), 1
         )
@@ -1143,6 +1147,7 @@ class TpModelWorker(BaseTpWorker):
                             all_ready = False
                             break
                     if all_ready:
+                        self._nano_pearl_wait_timeout_hits = 0
                         return
                     if timeout > 0 and time.monotonic() >= deadline:
                         now = time.monotonic()
@@ -1154,6 +1159,40 @@ class TpModelWorker(BaseTpWorker):
                                 len(self._nano_pearl_request_queue),
                                 len(self._nano_pearl_seq_id_to_rid),
                             )
+                        if self._nano_pearl_wait_timeout_limit > 0:
+                            self._nano_pearl_wait_timeout_hits += 1
+                            if (
+                                self._nano_pearl_wait_timeout_hits
+                                >= self._nano_pearl_wait_timeout_limit
+                            ):
+                                missing_rids = []
+                                for req in reqs:
+                                    token_queue = self._nano_pearl_pending_tokens.get(
+                                        req.rid
+                                    )
+                                    state = self._nano_pearl_active.get(req.rid)
+                                    if token_queue:
+                                        continue
+                                    token_queue = self._nano_pearl_pending_tokens.setdefault(
+                                        req.rid, deque()
+                                    )
+                                    token_queue.append(
+                                        self._nano_pearl_fallback_token(req)
+                                    )
+                                    if state is not None:
+                                        state.done = True
+                                    missing_rids.append(req.rid)
+                                if missing_rids:
+                                    for seq_id, rid in list(
+                                        self._nano_pearl_seq_id_to_rid.items()
+                                    ):
+                                        if rid in missing_rids:
+                                            self._nano_pearl_seq_id_to_rid.pop(
+                                                seq_id, None
+                                            )
+                                    self._nano_pearl_cv.notify_all()
+                                    self._nano_pearl_wait_timeout_hits = 0
+                                    return
                         deadline = time.monotonic() + timeout
                     self._nano_pearl_cv.wait(timeout=0.05)
                     continue
@@ -1171,6 +1210,7 @@ class TpModelWorker(BaseTpWorker):
                         any_ready = True
                         continue
                 if any_ready:
+                    self._nano_pearl_wait_timeout_hits = 0
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
