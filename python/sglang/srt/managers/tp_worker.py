@@ -523,6 +523,9 @@ class TpModelWorker(BaseTpWorker):
             int(os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_LIMIT", "3")), 0
         )
         self._nano_pearl_wait_timeout_hits = 0
+        self._nano_pearl_kick_on_timeout = bool(
+            int(os.getenv("NANO_PEARL_SGLANG_KICK_ON_TIMEOUT", "1"))
+        )
         self._nano_pearl_prefetch_steps = max(
             int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_STEPS", "2")), 1
         )
@@ -1159,6 +1162,14 @@ class TpModelWorker(BaseTpWorker):
                                 len(self._nano_pearl_request_queue),
                                 len(self._nano_pearl_seq_id_to_rid),
                             )
+                        if (
+                            self._nano_pearl_kick_on_timeout
+                            and not self._nano_pearl_request_queue
+                            and self._nano_pearl_seq_id_to_rid
+                        ):
+                            if self._nano_pearl_try_kick():
+                                deadline = time.monotonic() + timeout
+                                continue
                         if self._nano_pearl_wait_timeout_limit > 0:
                             self._nano_pearl_wait_timeout_hits += 1
                             if (
@@ -1226,6 +1237,35 @@ class TpModelWorker(BaseTpWorker):
                             )
                     return
                 self._nano_pearl_cv.wait(timeout=min(0.05, remaining))
+
+    def _nano_pearl_try_kick(self) -> bool:
+        if self.pearl_engine is None:
+            return False
+        if not self._nano_pearl_lock.acquire(blocking=False):
+            return False
+        try:
+            step_output, step_done = self.pearl_engine.stream_generate_step()
+        except Exception as exc:
+            logger.warning("nano-pearl kick failed: %s", exc)
+            return False
+        finally:
+            self._nano_pearl_lock.release()
+        with self._nano_pearl_cv:
+            for seq_id, token_ids in step_output:
+                rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                if rid is None:
+                    continue
+                self._nano_pearl_pending_tokens.setdefault(
+                    rid, deque()
+                ).extend(token_ids)
+            if step_done:
+                for rid in list(self._nano_pearl_active):
+                    state = self._nano_pearl_active.get(rid)
+                    if state is not None:
+                        state.done = True
+                self._nano_pearl_seq_id_to_rid.clear()
+            self._nano_pearl_cv.notify_all()
+        return True
 
     def _nano_pearl_get_prompt_ids(self, req):
         if req.origin_input_ids:
