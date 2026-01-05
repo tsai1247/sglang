@@ -51,7 +51,7 @@ python -m sglang.launch_server \
 ## 效能優化（與 sglang 排程整合）
 - `python/sglang/srt/managers/tp_worker.py`
   - 常駐 worker thread 以 `stream_generate_step()` 單步推進，並在每步之間插入新請求，降低批次鎖死造成的等待。
-  - streaming / non-streaming 共用同一套 token 佇列機制；prefill 維持單 token 回填，non-stream decode 在完成後可一次回填剩餘 tokens。
+  - streaming / non-streaming 共用同一套 token 佇列機制；non-stream decode 每步會一次回填當前 chunk，減少 scheduler 循環次數。
   - `next_token_ids` 使用 CPU tensor，避免 GPU/CPU 同步往返成本。
   - 新增 `NANO_PEARL_SGLANG_WAIT_TIMEOUT_S` 等待上限，避免卡死時無限阻塞。
  - `python/sglang/srt/managers/scheduler_output_processor_mixin.py`

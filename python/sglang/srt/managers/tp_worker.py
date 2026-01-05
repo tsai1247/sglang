@@ -729,17 +729,12 @@ class TpModelWorker(BaseTpWorker):
                     next_token_ids.append(token_id)
                     nano_pearl_output_ids.append([])
                 else:
-                    if state is not None and state.done and not is_prefill:
-                        token_ids = list(token_queue)
-                        token_queue.clear()
-                        if not token_ids:
-                            token_ids = [self._nano_pearl_fallback_token(req)]
-                        next_token_ids.append(token_ids[0])
-                        nano_pearl_output_ids.append(token_ids)
-                    else:
-                        token_id = token_queue.popleft()
-                        next_token_ids.append(token_id)
-                        nano_pearl_output_ids.append([])
+                    token_ids = list(token_queue)
+                    token_queue.clear()
+                    if not token_ids:
+                        token_ids = [self._nano_pearl_fallback_token(req)]
+                    next_token_ids.append(token_ids[0])
+                    nano_pearl_output_ids.append(token_ids)
 
                 if token_queue is not None and not token_queue:
                     self._nano_pearl_pending_tokens.pop(req.rid, None)
