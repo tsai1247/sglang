@@ -18,7 +18,7 @@ python -m sglang.launch_server \
   --draft-model-path ~/models/Qwen/Qwen3-1.7B \
   --draft-model-tp-size 1 \
   --tensor-parallel-size 1 \
-  --max-running-requests 8 \
+  --max-running-requests 16 \
   --stream-interval 32 \
   --schedule-conservativeness 0.5 \
   --port 12470 \

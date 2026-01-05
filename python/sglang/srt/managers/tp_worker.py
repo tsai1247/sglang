@@ -519,6 +519,9 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_prefetch_steps = max(
             int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_STEPS", "2")), 1
         )
+        self._nano_pearl_prefetch_flush_steps = max(
+            int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_FLUSH_STEPS", "2")), 1
+        )
 
         if self.use_pearl_engine:
             self._init_pearl_engine(server_args)
@@ -961,34 +964,55 @@ class TpModelWorker(BaseTpWorker):
 
                         outputs = []
                         done = False
+                        flush_steps = min(
+                            self._nano_pearl_prefetch_flush_steps,
+                            self._nano_pearl_prefetch_steps,
+                        )
                         for _ in range(self._nano_pearl_prefetch_steps):
                             with self._nano_pearl_lock:
                                 step_output, step_done = (
                                     self.pearl_engine.stream_generate_step()
                                 )
                             outputs.append(step_output)
-                            if step_done:
-                                done = True
-                                break
                             with self._nano_pearl_cv:
-                                if self._nano_pearl_request_queue:
+                                should_flush = (
+                                    step_done
+                                    or len(outputs) >= flush_steps
+                                    or self._nano_pearl_request_queue
+                                )
+                                if should_flush:
+                                    for output in outputs:
+                                        for seq_id, token_ids in output:
+                                            rid = self._nano_pearl_seq_id_to_rid.get(
+                                                seq_id
+                                            )
+                                            if rid is None:
+                                                continue
+                                            self._nano_pearl_pending_tokens.setdefault(
+                                                rid, deque()
+                                            ).extend(token_ids)
+                                    outputs.clear()
+                                    if step_done:
+                                        for rid in list(self._nano_pearl_active):
+                                            state = self._nano_pearl_active.get(rid)
+                                            if state is not None:
+                                                state.done = True
+                                        self._nano_pearl_seq_id_to_rid.clear()
+                                    self._nano_pearl_cv.notify_all()
+                                if step_done or self._nano_pearl_request_queue:
+                                    done = step_done
                                     break
-                        with self._nano_pearl_cv:
-                            for output in outputs:
-                                for seq_id, token_ids in output:
-                                    rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
-                                    if rid is None:
-                                        continue
-                                    self._nano_pearl_pending_tokens.setdefault(
-                                        rid, deque()
-                                    ).extend(token_ids)
-                            if done:
-                                for rid in list(self._nano_pearl_active):
-                                    state = self._nano_pearl_active.get(rid)
-                                    if state is not None:
-                                        state.done = True
-                                self._nano_pearl_seq_id_to_rid.clear()
-                            self._nano_pearl_cv.notify_all()
+                        if outputs:
+                            with self._nano_pearl_cv:
+                                for output in outputs:
+                                    for seq_id, token_ids in output:
+                                        rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                                        if rid is None:
+                                            continue
+                                        self._nano_pearl_pending_tokens.setdefault(
+                                            rid, deque()
+                                        ).extend(token_ids)
+                                self._nano_pearl_cv.notify_all()
                 except Exception as exc:
                     logger.error("nano-pearl: stream_generate_step failed: %s", exc)
                     with self._nano_pearl_cv:
