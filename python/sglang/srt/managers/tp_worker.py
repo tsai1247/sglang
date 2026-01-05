@@ -1025,6 +1025,8 @@ class TpModelWorker(BaseTpWorker):
     def _nano_pearl_enqueue_reqs(self, reqs):
         queued = []
         for req in reqs:
+            if req.stream:
+                req.nano_pearl_chunked = True
             prompt_ids = self._nano_pearl_get_prompt_ids(req)
             max_new_tokens = req.sampling_params.max_new_tokens
             max_new_tokens_limit = max(self.max_req_len - len(prompt_ids) - 1, 1)
@@ -1060,6 +1062,16 @@ class TpModelWorker(BaseTpWorker):
             while True:
                 if self._nano_pearl_stream_error is not None:
                     return
+                has_pending = bool(self._nano_pearl_request_queue)
+                has_active = bool(self._nano_pearl_seq_id_to_rid)
+                if not has_pending and not has_active:
+                    all_done = True
+                    for state in self._nano_pearl_active.values():
+                        if state is not None and not state.done:
+                            all_done = False
+                            break
+                    if all_done:
+                        return
                 any_ready = False
                 for req in reqs:
                     token_queue = self._nano_pearl_pending_tokens.get(req.rid)

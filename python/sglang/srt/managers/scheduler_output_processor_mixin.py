@@ -377,6 +377,45 @@ class SchedulerOutputProcessorMixin:
             if extra_total > 0:
                 extra_cache_loc = alloc_token_slots(self.tree_cache, extra_total)
                 extra_cache_loc = extra_cache_loc.to(torch.int32)
+            no_token_indices = [
+                i
+                for i, token_ids in enumerate(per_req_token_ids)
+                if not token_ids
+            ]
+            if no_token_indices and batch.out_cache_loc is not None:
+                rollback_indices = torch.tensor(
+                    no_token_indices, device=batch.device, dtype=torch.long
+                )
+                out_cache_loc = batch.out_cache_loc[rollback_indices]
+                if out_cache_loc.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(out_cache_loc)
+                if batch.seq_lens_cpu is not None:
+                    positions = batch.seq_lens_cpu[rollback_indices] - 1
+                else:
+                    positions = batch.seq_lens[rollback_indices] - 1
+                req_indices = torch.tensor(
+                    [batch.reqs[i].req_pool_idx for i in no_token_indices],
+                    device=batch.device,
+                    dtype=torch.int64,
+                )
+                self.req_to_token_pool.write(
+                    (req_indices, positions.to(torch.int64)),
+                    torch.zeros_like(req_indices, dtype=torch.int32),
+                )
+                if batch.seq_lens is not None:
+                    batch.seq_lens[rollback_indices] -= 1
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu[rollback_indices] -= 1
+                if batch.orig_seq_lens is not None:
+                    batch.orig_seq_lens[rollback_indices] -= 1
+                if batch.seq_lens_sum is not None:
+                    batch.seq_lens_sum -= len(no_token_indices)
+                for i in no_token_indices:
+                    req = batch.reqs[i]
+                    if req.kv_committed_len > 0:
+                        req.kv_committed_len -= 1
+                    if req.kv_allocated_len > 0:
+                        req.kv_allocated_len -= 1
 
         if use_nano_pearl:
             self.num_generated_tokens += generated_tokens
@@ -1009,13 +1048,16 @@ class SchedulerOutputProcessorMixin:
                         req.sampling_params.stream_interval or self.stream_interval
                     )
 
-                    # origin stream_interval logic
-                    should_output = (
-                        len(req.output_ids) % stream_interval == 1
-                        if not self.model_config.is_multimodal_gen
-                        and stream_interval > 1
-                        else len(req.output_ids) % stream_interval == 0
-                    )
+                    if getattr(req, "nano_pearl_chunked", False):
+                        should_output = len(req.output_ids) > req.send_token_offset
+                    else:
+                        # origin stream_interval logic
+                        should_output = (
+                            len(req.output_ids) % stream_interval == 1
+                            if not self.model_config.is_multimodal_gen
+                            and stream_interval > 1
+                            else len(req.output_ids) % stream_interval == 0
+                        )
 
                     if should_output:
                         # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
