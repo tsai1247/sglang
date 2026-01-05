@@ -445,6 +445,28 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 if use_nano_pearl:
                     req.fill_ids = req.origin_input_ids + req.output_ids
+                    expected_len = len(req.fill_ids)
+                    if req.kv_committed_len != expected_len:
+                        logger.warning(
+                            "nano-pearl KV len mismatch for %s: %s vs %s",
+                            req.rid,
+                            req.kv_committed_len,
+                            expected_len,
+                        )
+                        if req.kv_committed_len < expected_len:
+                            req.fill_ids = req.fill_ids[: req.kv_committed_len]
+                        else:
+                            req.kv_committed_len = expected_len
+                    if req.kv_allocated_len > req.kv_committed_len:
+                        tail_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx,
+                            req.kv_committed_len : req.kv_allocated_len,
+                        ]
+                        tail_indices = tail_indices[tail_indices != 0]
+                        if tail_indices.numel() > 0:
+                            self.token_to_kv_pool_allocator.free(tail_indices)
+                        req.kv_allocated_len = req.kv_committed_len
+                    self._sanitize_nano_pearl_kv_indices(req, batch)
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -511,6 +533,39 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
+    def _sanitize_nano_pearl_kv_indices(
+        self: Scheduler, req: Req, batch: ScheduleBatch
+    ) -> None:
+        if req.req_pool_idx is None or req.kv_committed_len <= 0:
+            return
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.kv_committed_len
+        ]
+        missing_mask = kv_indices == 0
+        if not missing_mask.any().item():
+            return
+        missing_positions = missing_mask.nonzero(as_tuple=False).flatten()
+        missing_count = missing_positions.numel()
+        if missing_count == 0:
+            return
+        new_cache_loc = alloc_token_slots(self.tree_cache, missing_count).to(
+            torch.int32
+        )
+        req_indices = torch.full(
+            (missing_count,),
+            req.req_pool_idx,
+            device=batch.device,
+            dtype=torch.int64,
+        )
+        self.req_to_token_pool.write(
+            (req_indices, missing_positions), new_cache_loc
+        )
+        logger.warning(
+            "nano-pearl filled %d missing KV slots for %s",
+            missing_count,
+            req.rid,
+        )
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
