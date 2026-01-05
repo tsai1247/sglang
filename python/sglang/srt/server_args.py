@@ -278,6 +278,7 @@ class ServerArgs:
     nano_pearl_max_num_batched_tokens: Optional[int] = None
     nano_pearl_max_num_seqs: Optional[int] = None
     nano_pearl_gpu_memory_utilization: Optional[float] = None
+    nano_pearl_gamma: Optional[int] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -2513,6 +2514,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.nano_pearl_gpu_memory_utilization,
             help="Override nano-pearl gpu_memory_utilization.",
+        )
+        parser.add_argument(
+            "--nano-pearl-gamma",
+            type=int,
+            default=ServerArgs.nano_pearl_gamma,
+            help="Set nano-pearl gamma (disables auto gamma when provided).",
         )
 
         parser.add_argument(

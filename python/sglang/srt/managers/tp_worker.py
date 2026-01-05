@@ -839,6 +839,14 @@ class TpModelWorker(BaseTpWorker):
             )
         )
 
+        gamma = server_args.nano_pearl_gamma
+        if gamma is None and server_args.nano_pearl_share_gpus:
+            gamma = 4
+            logger.warning(
+                "nano-pearl share-gpus defaults gamma to %d to skip auto-set.",
+                gamma,
+            )
+
         config = PEARLConfig(
             server_args.speculative_draft_model_path,
             server_args.model_path,
@@ -849,6 +857,7 @@ class TpModelWorker(BaseTpWorker):
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            gamma=gamma if gamma is not None else -1,
         )
         self.pearl_engine = PEARLEngine(config)
         self._nano_pearl_sampling_cls = SamplingParams
