@@ -771,13 +771,19 @@ class TpModelWorker(BaseTpWorker):
         from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams
 
         if server_args.tp_size != 1 or server_args.pp_size != 1:
-            raise RuntimeError("nano-pearl engine requires tp_size=1 and pp_size=1.")
+            raise RuntimeError(
+                "nano-pearl engine requires sglang tp_size=1 and pp_size=1. "
+                "Use --nano-pearl-target-tp-size to set PEARL TP."
+            )
+        target_tp_size = (
+            server_args.nano_pearl_target_tp_size or server_args.tp_size
+        )
         if server_args.nano_pearl_share_gpus:
             required_gpus = max(
-                server_args.draft_model_tp_size, server_args.tp_size
+                server_args.draft_model_tp_size, target_tp_size
             )
         else:
-            required_gpus = server_args.draft_model_tp_size + server_args.tp_size
+            required_gpus = server_args.draft_model_tp_size + target_tp_size
         available_gpus = torch.cuda.device_count()
         if available_gpus < required_gpus:
             raise RuntimeError(
@@ -787,11 +793,16 @@ class TpModelWorker(BaseTpWorker):
             )
 
         max_num_batched_tokens = (
-            server_args.max_total_tokens
+            server_args.nano_pearl_max_num_batched_tokens
+            or server_args.max_total_tokens
             or server_args.max_prefill_tokens
             or 16384
         )
-        max_num_seqs = server_args.max_running_requests or 512
+        max_num_seqs = (
+            server_args.nano_pearl_max_num_seqs
+            or server_args.max_running_requests
+            or 512
+        )
         max_model_len = self.model_config.context_len
 
         if max_num_batched_tokens < max_model_len:
@@ -806,20 +817,38 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_max_num_batched_tokens = max_num_batched_tokens
         self._nano_pearl_max_num_seqs = max_num_seqs
 
+        if (
+            server_args.nano_pearl_share_gpus
+            and server_args.nano_pearl_max_num_batched_tokens is None
+            and server_args.max_total_tokens is None
+            and server_args.max_prefill_tokens == 16384
+        ):
+            logger.warning(
+                "nano-pearl share-gpus with default max_num_batched_tokens=16384 "
+                "can be too large; lowering to 8192."
+            )
+            max_num_batched_tokens = 8192
+
+        gpu_memory_utilization = (
+            server_args.nano_pearl_gpu_memory_utilization
+            if server_args.nano_pearl_gpu_memory_utilization is not None
+            else (
+                server_args.mem_fraction_static
+                if server_args.mem_fraction_static is not None
+                else 0.9
+            )
+        )
+
         config = PEARLConfig(
             server_args.speculative_draft_model_path,
             server_args.model_path,
             draft_tensor_parallel_size=server_args.draft_model_tp_size,
-            target_tensor_parallel_size=server_args.tp_size,
+            target_tensor_parallel_size=target_tp_size,
             share_draft_target_gpus=server_args.nano_pearl_share_gpus,
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
-            gpu_memory_utilization=(
-                server_args.mem_fraction_static
-                if server_args.mem_fraction_static is not None
-                else 0.9
-            ),
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         self.pearl_engine = PEARLEngine(config)
         self._nano_pearl_sampling_cls = SamplingParams
