@@ -713,80 +713,87 @@ class TpModelWorker(BaseTpWorker):
         if new_reqs:
             self._nano_pearl_enqueue_reqs(new_reqs)
 
-        self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
+        def _collect_tokens():
+            self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
+            next_token_ids: List[int] = []
+            nano_pearl_output_ids: List[List[int]] = []
+            with self._nano_pearl_cv:
+                stream_error = self._nano_pearl_stream_error
+                no_engine_active = (
+                    not self._nano_pearl_request_queue
+                    and not self._nano_pearl_seq_id_to_rid
+                    and not self._nano_pearl_active
+                )
+                for req in model_worker_batch.reqs:
+                    token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                    state = self._nano_pearl_active.get(req.rid)
 
-        is_prefill = model_worker_batch.forward_mode.is_extend()
-        next_token_ids: List[int] = []
-        nano_pearl_output_ids: List[List[int]] = []
-        with self._nano_pearl_cv:
-            stream_error = self._nano_pearl_stream_error
-            no_engine_active = (
-                not self._nano_pearl_request_queue
-                and not self._nano_pearl_seq_id_to_rid
-                and not self._nano_pearl_active
-            )
-            for req in model_worker_batch.reqs:
-                token_queue = self._nano_pearl_pending_tokens.get(req.rid)
-                state = self._nano_pearl_active.get(req.rid)
-
-                if stream_error is not None:
-                    token_id = self._nano_pearl_fallback_token(req)
-                    next_token_ids.append(token_id)
-                    nano_pearl_output_ids.append([])
-                    if state is not None and state.done:
-                        self._nano_pearl_active.pop(req.rid, None)
-                    continue
-                if not token_queue:
-                    if state is None or not state.done:
-                        if no_engine_active:
-                            token_id = self._nano_pearl_fallback_token(req)
-                            next_token_ids.append(token_id)
-                            nano_pearl_output_ids.append([])
-                        else:
-                            # -1 means no token yet; scheduler should skip update.
-                            next_token_ids.append(-1)
-                            nano_pearl_output_ids.append([])
+                    if stream_error is not None:
+                        token_id = self._nano_pearl_fallback_token(req)
+                        next_token_ids.append(token_id)
+                        nano_pearl_output_ids.append([])
+                        if state is not None and state.done:
+                            self._nano_pearl_active.pop(req.rid, None)
                         continue
-                    token_id = self._nano_pearl_fallback_token(req)
-                    next_token_ids.append(token_id)
-                    nano_pearl_output_ids.append([])
-                    if state is not None and state.done:
-                        self._nano_pearl_active.pop(req.rid, None)
-                    continue
+                    if not token_queue:
+                        if state is None or not state.done:
+                            if no_engine_active:
+                                token_id = self._nano_pearl_fallback_token(req)
+                                next_token_ids.append(token_id)
+                                nano_pearl_output_ids.append([])
+                            else:
+                                # -1 means no token yet; scheduler should skip update.
+                                next_token_ids.append(-1)
+                                nano_pearl_output_ids.append([])
+                            continue
+                        token_id = self._nano_pearl_fallback_token(req)
+                        next_token_ids.append(token_id)
+                        nano_pearl_output_ids.append([])
+                        if state is not None and state.done:
+                            self._nano_pearl_active.pop(req.rid, None)
+                        continue
 
-                if req.stream:
-                    token_id = token_queue.popleft()
-                    next_token_ids.append(token_id)
-                    nano_pearl_output_ids.append([])
+                    if req.stream:
+                        token_id = token_queue.popleft()
+                        next_token_ids.append(token_id)
+                        nano_pearl_output_ids.append([])
+                    else:
+                        token_ids = list(token_queue)
+                        token_queue.clear()
+                        if not token_ids:
+                            token_ids = [self._nano_pearl_fallback_token(req)]
+                        next_token_ids.append(token_ids[0])
+                        nano_pearl_output_ids.append(token_ids)
+
+                    if token_queue is not None and not token_queue:
+                        self._nano_pearl_pending_tokens.pop(req.rid, None)
+                        if state is not None and state.done:
+                            self._nano_pearl_active.pop(req.rid, None)
+            return next_token_ids, nano_pearl_output_ids
+
+        def _fill_batch_result(batch_result: GenerationBatchResult):
+            next_token_ids, nano_pearl_output_ids = _collect_tokens()
+            next_token_device = torch.device("cpu")
+            if not self.server_args.disable_overlap_schedule:
+                if model_worker_batch.input_ids is not None:
+                    next_token_device = model_worker_batch.input_ids.device
                 else:
-                    token_ids = list(token_queue)
-                    token_queue.clear()
-                    if not token_ids:
-                        token_ids = [self._nano_pearl_fallback_token(req)]
-                    next_token_ids.append(token_ids[0])
-                    nano_pearl_output_ids.append(token_ids)
+                    next_token_device = torch.device(self.device)
+            batch_result.next_token_ids = torch.tensor(
+                next_token_ids, dtype=torch.long, device=next_token_device
+            )
+            batch_result.nano_pearl_output_ids = nano_pearl_output_ids
+            return batch_result
 
-                if token_queue is not None and not token_queue:
-                    self._nano_pearl_pending_tokens.pop(req.rid, None)
-                    if state is not None and state.done:
-                        self._nano_pearl_active.pop(req.rid, None)
-
-        next_token_device = torch.device("cpu")
-        if not self.server_args.disable_overlap_schedule:
-            if model_worker_batch.input_ids is not None:
-                next_token_device = model_worker_batch.input_ids.device
-            else:
-                next_token_device = torch.device(self.device)
-        next_token_ids_tensor = torch.tensor(
-            next_token_ids, dtype=torch.long, device=next_token_device
-        )
         logits_output = LogitsProcessorOutput(next_token_logits=None)
-        return GenerationBatchResult(
+        batch_result = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids_tensor,
             can_run_cuda_graph=False,
-            nano_pearl_output_ids=nano_pearl_output_ids,
         )
+        if self.server_args.disable_overlap_schedule:
+            return _fill_batch_result(batch_result)
+        batch_result.delay_sample_func = lambda: _fill_batch_result(batch_result)
+        return batch_result
 
     def _ensure_nano_pearl_importable(self):
         nano_pearl_root = os.path.abspath(
