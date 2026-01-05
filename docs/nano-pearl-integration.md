@@ -72,16 +72,19 @@ python -m sglang.launch_server \
   - 新增 `stream_generate()` 介面，搭配 shared memory 回傳 chunk。
   - 新增 `stream_generate_steps()` 介面，支援單次跨多步的 stream 呼叫。
 - `python/sglang/srt/managers/tp_worker.py`
-  - worker thread 呼叫 `stream_generate_step()` 單步推進，逐步提供 token 給 Scheduler。
-  - 目前改為呼叫 `stream_generate_steps()`，可用環境變數控制每次跨步數。
+  - worker thread 呼叫 `stream_generate_steps()` 跨步推進，可用環境變數控制每次跨步數。
 
 ## 效能優化（與 sglang 排程整合）
 - `python/sglang/srt/managers/tp_worker.py`
-  - 常駐 worker thread 以 `stream_generate_step()` 單步推進，並在每步之間插入新請求，降低批次鎖死造成的等待。
+  - 常駐 worker thread 以 `stream_generate_steps()` 跨步推進，並在每輪之間插入新請求，降低批次鎖死造成的等待。
   - streaming / non-streaming 共用同一套 token 佇列機制；non-stream decode 每步會一次回填當前 chunk，減少 scheduler 循環次數。
   - overlap 啟用時 `next_token_ids` 會建立在 GPU，避免 future map 跨裝置錯誤。
   - 新增 `NANO_PEARL_SGLANG_WAIT_TIMEOUT_S` 等待上限，避免卡死時無限阻塞。
   - 新增 `NANO_PEARL_SGLANG_PREFETCH_STEPS` 與 `NANO_PEARL_SGLANG_PREFETCH_FLUSH_STEPS`，平衡 IPC 次數與 token 回填時機。
+ - `python/nano-PEARL/nano_pearl/pearl_engine/pearl_model_runner.py`
+   - target `prepare_pearl_decode` 改用可重用的 GPU buffer，降低 decode 期重複配置成本。
+   - `NANO_PEARL_ENABLE_DECODE_BUFFERS=1` 可啟用 buffer 重用（預設關閉以避免穩定性問題）。
+   - 新增 `NANO_PEARL_STREAM_BARRIER_INTERVAL`，可降低跨 rank barrier 的頻率。
  - `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
    - nano-pearl decode 支援一次回填多 token 時，額外分配 KV 索引並同步更新 seq_len 與 KV 統計，避免記憶體帳務錯亂。
  - `python/sglang/srt/managers/scheduler_runtime_checker_mixin.py`

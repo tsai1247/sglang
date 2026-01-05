@@ -6,8 +6,12 @@ source .venv/bin/activate
 ls /dev/shm | grep -E '^(draft_group|target_group)$' >/dev/null 2>&1 && sudo rm -f /dev/shm/draft_group /dev/shm/target_group
 CUDA_VISIBLE_DEVICES=0,1 \
 SGLANG_NANO_PEARL_ALLOW_OVERLAP=1 \
-NANO_PEARL_GAMMA=6 \
+NANO_PEARL_GAMMA=8 \
+NANO_PEARL_ACCEPT_RATE_LOG_INTERVAL=50 \
+NANO_PEARL_FORCE_TEMPERATURE=0 \
 NANO_PEARL_SGLANG_PREFETCH_STEPS=8 \
+NANO_PEARL_STREAM_BARRIER_INTERVAL=1 \
+NANO_PEARL_SGLANG_PREFETCH_FLUSH_STEPS=2 \
 NANO_PEARL_SGLANG_STREAM_WAIT_TIMEOUT_S=0.5 \
 NANO_PEARL_SGLANG_WAIT_TIMEOUT_S=10 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -18,8 +22,8 @@ python -m sglang.launch_server \
   --draft-model-path ~/models/Qwen/Qwen3-1.7B \
   --draft-model-tp-size 1 \
   --tensor-parallel-size 1 \
-  --max-running-requests 16 \
-  --stream-interval 32 \
-  --schedule-conservativeness 0.5 \
+  --max-running-requests 8 \
+  --stream-interval 128 \
+  --schedule-conservativeness 0.3 \
   --port 12470 \
   --mem-fraction-static 0.95

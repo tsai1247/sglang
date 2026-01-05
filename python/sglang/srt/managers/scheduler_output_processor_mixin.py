@@ -353,7 +353,6 @@ class SchedulerOutputProcessorMixin:
         stream_reqs = None
         extra_token_counts = None
         extra_cache_loc = None
-        extra_offset = 0
         extra_total = 0
         if use_nano_pearl:
             per_req_token_ids = []
@@ -421,6 +420,59 @@ class SchedulerOutputProcessorMixin:
                         req.kv_committed_len -= 1
                     if req.kv_allocated_len > 0:
                         req.kv_allocated_len -= 1
+            if extra_total > 0:
+                if extra_cache_loc is None:
+                    raise RuntimeError(
+                        "nano-pearl extra cache allocation is missing."
+                    )
+                counts_device = torch.tensor(
+                    extra_token_counts, device=batch.device, dtype=torch.int64
+                )
+                mask = counts_device > 0
+                if mask.any().item():
+                    bases = torch.tensor(
+                        [req.kv_committed_len for req in batch.reqs],
+                        device=batch.device,
+                        dtype=torch.int64,
+                    )
+                    req_pool_indices = torch.tensor(
+                        [req.req_pool_idx for req in batch.reqs],
+                        device=batch.device,
+                        dtype=torch.int64,
+                    )
+                    counts_nz = counts_device[mask]
+                    bases_nz = bases[mask]
+                    req_pool_nz = req_pool_indices[mask]
+                    total = int(counts_nz.sum().item())
+                    req_ids = torch.repeat_interleave(
+                        torch.arange(
+                            counts_nz.numel(),
+                            device=batch.device,
+                            dtype=torch.int64,
+                        ),
+                        counts_nz,
+                    )
+                    starts = torch.cumsum(counts_nz, 0) - counts_nz
+                    flat_index = torch.arange(
+                        total, device=batch.device, dtype=torch.int64
+                    )
+                    local_index = flat_index - starts[req_ids]
+                    positions = bases_nz[req_ids] + local_index
+                    pool_indices = req_pool_nz[req_ids]
+                    batch.req_to_token_pool.write(
+                        (pool_indices, positions), extra_cache_loc[:total]
+                    )
+                    if batch.seq_lens is not None:
+                        batch.seq_lens.add_(counts_device)
+                    if batch.seq_lens_cpu is not None:
+                        counts_cpu = torch.tensor(
+                            extra_token_counts, device="cpu", dtype=torch.int64
+                        )
+                        batch.seq_lens_cpu.add_(counts_cpu)
+                    if batch.orig_seq_lens is not None:
+                        batch.orig_seq_lens.add_(counts_device)
+                    if batch.seq_lens_sum is not None:
+                        batch.seq_lens_sum += extra_total
 
         if use_nano_pearl:
             self.num_generated_tokens += generated_tokens
@@ -473,38 +525,6 @@ class SchedulerOutputProcessorMixin:
             if use_nano_pearl and extra_token_counts is not None:
                 extra_tokens = extra_token_counts[i]
                 if extra_tokens:
-                    if extra_cache_loc is None:
-                        raise RuntimeError(
-                            "nano-pearl extra cache allocation is missing."
-                        )
-                    base = req.kv_committed_len
-                    positions = torch.arange(
-                        base,
-                        base + extra_tokens,
-                        device=batch.device,
-                        dtype=torch.int64,
-                    )
-                    req_indices = torch.full(
-                        (extra_tokens,),
-                        req.req_pool_idx,
-                        device=batch.device,
-                        dtype=torch.int64,
-                    )
-                    loc_slice = extra_cache_loc[
-                        extra_offset : extra_offset + extra_tokens
-                    ]
-                    extra_offset += extra_tokens
-                    batch.req_to_token_pool.write(
-                        (req_indices, positions), loc_slice
-                    )
-                    if batch.seq_lens is not None:
-                        batch.seq_lens[i] += extra_tokens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu[i] += extra_tokens
-                    if batch.orig_seq_lens is not None:
-                        batch.orig_seq_lens[i] += extra_tokens
-                    if batch.seq_lens_sum is not None:
-                        batch.seq_lens_sum += extra_tokens
                     req.kv_committed_len += extra_tokens
                     req.kv_allocated_len += extra_tokens
 

@@ -501,6 +501,7 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_active: Dict[str, NanoPearlRequestState] = {}
         self._nano_pearl_warned_sampling = False
         self._nano_pearl_logged_sampling = False
+        self._nano_pearl_logged_temperature_override = False
         self._nano_pearl_lock = threading.Lock()
         self._nano_pearl_cv = threading.Condition()
         self._nano_pearl_request_queue: Deque[NanoPearlQueuedRequest] = deque()
@@ -509,6 +510,8 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_stream_error: Optional[BaseException] = None
         self._nano_pearl_max_num_batched_tokens: Optional[int] = None
         self._nano_pearl_max_num_seqs: Optional[int] = None
+        self._nano_pearl_invalid_token_warned: set[str] = set()
+        self._nano_pearl_missing_token_warned: set[str] = set()
         self._nano_pearl_wait_timeout_s = float(
             os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_S", "5")
         )
@@ -521,6 +524,9 @@ class TpModelWorker(BaseTpWorker):
         )
         self._nano_pearl_prefetch_flush_steps = max(
             int(os.getenv("NANO_PEARL_SGLANG_PREFETCH_FLUSH_STEPS", "2")), 1
+        )
+        self._nano_pearl_use_stream_steps = bool(
+            int(os.getenv("NANO_PEARL_SGLANG_USE_STREAM_STEPS", "0"))
         )
 
         if self.use_pearl_engine:
@@ -745,9 +751,16 @@ class TpModelWorker(BaseTpWorker):
                                 next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
                             else:
-                                # -1 means no token yet; scheduler should skip update.
-                                next_token_ids.append(-1)
+                                token_id = self._nano_pearl_fallback_token(req)
+                                next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
+                                if req.rid not in self._nano_pearl_missing_token_warned:
+                                    logger.warning(
+                                        "nano-pearl token queue empty for %s; "
+                                        "using fallback token.",
+                                        req.rid,
+                                    )
+                                    self._nano_pearl_missing_token_warned.add(req.rid)
                             continue
                         token_id = self._nano_pearl_fallback_token(req)
                         next_token_ids.append(token_id)
@@ -758,6 +771,9 @@ class TpModelWorker(BaseTpWorker):
 
                     if req.stream:
                         token_id = token_queue.popleft()
+                        token_id = self._nano_pearl_sanitize_token_ids(
+                            req, [token_id]
+                        )[0]
                         next_token_ids.append(token_id)
                         nano_pearl_output_ids.append([])
                     else:
@@ -765,6 +781,7 @@ class TpModelWorker(BaseTpWorker):
                         token_queue.clear()
                         if not token_ids:
                             token_ids = [self._nano_pearl_fallback_token(req)]
+                        token_ids = self._nano_pearl_sanitize_token_ids(req, token_ids)
                         next_token_ids.append(token_ids[0])
                         nano_pearl_output_ids.append(token_ids)
 
@@ -892,10 +909,40 @@ class TpModelWorker(BaseTpWorker):
             self._nano_pearl_warned_sampling = True
         if max_new_tokens is None:
             max_new_tokens = sampling_params.max_new_tokens
+        temperature = sampling_params.temperature
+        force_temperature = os.getenv("NANO_PEARL_FORCE_TEMPERATURE")
+        if force_temperature is not None:
+            try:
+                temperature = float(force_temperature)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid NANO_PEARL_FORCE_TEMPERATURE value: {force_temperature}"
+                ) from exc
+            if not self._nano_pearl_logged_temperature_override:
+                logger.warning(
+                    "nano-pearl overriding temperature to %s", temperature
+                )
+                self._nano_pearl_logged_temperature_override = True
+        else:
+            temperature_scale = os.getenv("NANO_PEARL_TEMPERATURE_SCALE")
+            if temperature_scale is not None:
+                try:
+                    temperature *= float(temperature_scale)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Invalid NANO_PEARL_TEMPERATURE_SCALE value: "
+                        f"{temperature_scale}"
+                    ) from exc
+                if not self._nano_pearl_logged_temperature_override:
+                    logger.warning(
+                        "nano-pearl scaling temperature by %s",
+                        temperature_scale,
+                    )
+                    self._nano_pearl_logged_temperature_override = True
         if not self._nano_pearl_logged_sampling:
             self._nano_pearl_logged_sampling = True
         return self._nano_pearl_sampling_cls(
-            temperature=sampling_params.temperature,
+            temperature=temperature,
             max_tokens=max_new_tokens,
             ignore_eos=sampling_params.ignore_eos,
         )
@@ -966,36 +1013,60 @@ class TpModelWorker(BaseTpWorker):
                             self._nano_pearl_prefetch_flush_steps,
                             self._nano_pearl_prefetch_steps,
                         )
-                        steps_left = self._nano_pearl_prefetch_steps
-                        while steps_left > 0:
-                            steps = min(flush_steps, steps_left)
-                            with self._nano_pearl_cv:
-                                if self._nano_pearl_request_queue:
-                                    steps = 1
-                            with self._nano_pearl_lock:
-                                step_output, step_done = (
-                                    self.pearl_engine.stream_generate_steps(steps)
-                                )
-                            with self._nano_pearl_cv:
-                                for seq_id, token_ids in step_output:
-                                    rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
-                                    if rid is None:
-                                        continue
-                                    self._nano_pearl_pending_tokens.setdefault(
-                                        rid, deque()
-                                    ).extend(token_ids)
-                                if step_done:
-                                    for rid in list(self._nano_pearl_active):
-                                        state = self._nano_pearl_active.get(rid)
-                                        if state is not None:
-                                            state.done = True
-                                    self._nano_pearl_seq_id_to_rid.clear()
-                                self._nano_pearl_cv.notify_all()
-                                if step_done or self._nano_pearl_request_queue:
-                                    break
-                            steps_left -= steps
+                        if self._nano_pearl_use_stream_steps:
+                            steps_left = self._nano_pearl_prefetch_steps
+                            while steps_left > 0:
+                                steps = min(flush_steps, steps_left)
+                                with self._nano_pearl_cv:
+                                    if self._nano_pearl_request_queue:
+                                        steps = 1
+                                with self._nano_pearl_lock:
+                                    step_output, step_done = (
+                                        self.pearl_engine.stream_generate_steps(steps)
+                                    )
+                                with self._nano_pearl_cv:
+                                    for seq_id, token_ids in step_output:
+                                        rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                                        if rid is None:
+                                            continue
+                                        self._nano_pearl_pending_tokens.setdefault(
+                                            rid, deque()
+                                        ).extend(token_ids)
+                                    if step_done:
+                                        for rid in list(self._nano_pearl_active):
+                                            state = self._nano_pearl_active.get(rid)
+                                            if state is not None:
+                                                state.done = True
+                                        self._nano_pearl_seq_id_to_rid.clear()
+                                    self._nano_pearl_cv.notify_all()
+                                    if step_done or self._nano_pearl_request_queue:
+                                        break
+                                steps_left -= steps
+                        else:
+                            for _ in range(self._nano_pearl_prefetch_steps):
+                                with self._nano_pearl_lock:
+                                    step_output, step_done = (
+                                        self.pearl_engine.stream_generate_step()
+                                    )
+                                with self._nano_pearl_cv:
+                                    for seq_id, token_ids in step_output:
+                                        rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
+                                        if rid is None:
+                                            continue
+                                        self._nano_pearl_pending_tokens.setdefault(
+                                            rid, deque()
+                                        ).extend(token_ids)
+                                    if step_done:
+                                        for rid in list(self._nano_pearl_active):
+                                            state = self._nano_pearl_active.get(rid)
+                                            if state is not None:
+                                                state.done = True
+                                        self._nano_pearl_seq_id_to_rid.clear()
+                                    self._nano_pearl_cv.notify_all()
+                                    if step_done or self._nano_pearl_request_queue:
+                                        break
                 except Exception as exc:
-                    logger.error("nano-pearl: stream_generate_steps failed: %s", exc)
+                    logger.error("nano-pearl: stream_generate_step failed: %s", exc)
                     with self._nano_pearl_cv:
                         self._nano_pearl_stream_error = exc
                         for rid in list(self._nano_pearl_active):
@@ -1133,6 +1204,32 @@ class TpModelWorker(BaseTpWorker):
         if eos_ids:
             return next(iter(eos_ids))
         return 0
+
+    def _nano_pearl_sanitize_token_ids(self, req, token_ids: List[int]) -> List[int]:
+        if not token_ids:
+            return token_ids
+        vocab_size = self.model_config.vocab_size
+        fallback = self._nano_pearl_fallback_token(req)
+        sanitized: List[int] = []
+        invalid = False
+        for token_id in token_ids:
+            try:
+                token_id = int(token_id)
+            except (TypeError, ValueError):
+                token_id = fallback
+                invalid = True
+            else:
+                if token_id < 0 or token_id >= vocab_size:
+                    token_id = fallback
+                    invalid = True
+            sanitized.append(token_id)
+        if invalid and req.rid not in self._nano_pearl_invalid_token_warned:
+            logger.warning(
+                "nano-pearl produced invalid token ids for %s; replaced with eos.",
+                req.rid,
+            )
+            self._nano_pearl_invalid_token_warned.add(req.rid)
+        return sanitized
 
     def get_remote_instance_transfer_engine_info(self):
         return (
