@@ -7,7 +7,7 @@ ls /dev/shm | grep -E '^(draft_group|target_group)$' >/dev/null 2>&1 && sudo rm 
 CUDA_VISIBLE_DEVICES=0,1 \
 SGLANG_NANO_PEARL_ALLOW_OVERLAP=1 \
 NANO_PEARL_GAMMA=6 \
-NANO_PEARL_SGLANG_PREFETCH_STEPS=8 \
+NANO_PEARL_SGLANG_PREFETCH_STEPS=4 \
 NANO_PEARL_SGLANG_STREAM_WAIT_TIMEOUT_S=0.5 \
 NANO_PEARL_SGLANG_WAIT_TIMEOUT_S=10 \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -18,7 +18,7 @@ python -m sglang.launch_server \
   --draft-model-path ~/models/Qwen/Qwen3-1.7B \
   --draft-model-tp-size 1 \
   --tensor-parallel-size 1 \
-  --max-running-requests 8 \
+  --max-running-requests 12 \
   --stream-interval 32 \
   --schedule-conservativeness 0.5 \
   --port 12470 \
