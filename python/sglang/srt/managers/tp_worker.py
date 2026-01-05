@@ -1030,6 +1030,7 @@ class TpModelWorker(BaseTpWorker):
         timeout = self._nano_pearl_wait_timeout_s
         if any(req.stream for req in reqs):
             timeout = min(timeout, self._nano_pearl_stream_wait_timeout_s)
+        require_all_ready = not self.server_args.disable_overlap_schedule
         deadline = time.monotonic() + timeout
         with self._nano_pearl_cv:
             while True:
@@ -1045,6 +1046,32 @@ class TpModelWorker(BaseTpWorker):
                             break
                     if all_done:
                         return
+                if require_all_ready:
+                    all_ready = True
+                    for req in reqs:
+                        token_queue = self._nano_pearl_pending_tokens.get(req.rid)
+                        state = self._nano_pearl_active.get(req.rid)
+                        if token_queue:
+                            continue
+                        if state is None or not state.done:
+                            all_ready = False
+                            break
+                    if all_ready:
+                        return
+                    if timeout > 0 and time.monotonic() >= deadline:
+                        now = time.monotonic()
+                        if now - self._nano_pearl_last_wait_warn_ts > 5:
+                            self._nano_pearl_last_wait_warn_ts = now
+                            logger.warning(
+                                "nano-pearl wait timeout (%.2fs). pending=%d active=%d",
+                                timeout,
+                                len(self._nano_pearl_request_queue),
+                                len(self._nano_pearl_seq_id_to_rid),
+                            )
+                        deadline = time.monotonic() + timeout
+                    self._nano_pearl_cv.wait(timeout=0.05)
+                    continue
+
                 any_ready = False
                 for req in reqs:
                     token_queue = self._nano_pearl_pending_tokens.get(req.rid)

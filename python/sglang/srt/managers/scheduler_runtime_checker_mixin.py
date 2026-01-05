@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import torch
 import time
 import warnings
 from typing import TYPE_CHECKING
@@ -163,6 +164,60 @@ class SchedulerRuntimeCheckerMixin:
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
         return memory_leak, token_msg
 
+    def _reclaim_nano_pearl_kv_leak(self: Scheduler) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        free_pages = set(allocator.free_pages.tolist())
+        if getattr(allocator, "release_pages", None) is not None:
+            free_pages.update(allocator.release_pages.tolist())
+
+        cached_pages = set()
+        try:
+            cached_values = self.tree_cache.all_values_flatten()
+        except Exception:
+            cached_values = None
+        if cached_values is not None and cached_values.numel() > 0:
+            cached_pages = set(cached_values.tolist())
+            cached_pages.discard(0)
+
+        expected_pages = set(range(1, allocator.size + 1))
+        leaked_pages = expected_pages - free_pages - cached_pages
+        if not leaked_pages:
+            return 0
+
+        leaked_tensor = torch.tensor(
+            list(leaked_pages), dtype=torch.int64, device=allocator.device
+        )
+        allocator.free(leaked_tensor)
+        return len(leaked_pages)
+
+    def _sanitize_nano_pearl_free_pages(self: Scheduler) -> bool:
+        allocator = self.token_to_kv_pool_allocator
+        free_pages = getattr(allocator, "free_pages", None)
+        if free_pages is None:
+            return False
+        release_pages = getattr(allocator, "release_pages", None)
+        if release_pages is not None and release_pages.numel() > 0:
+            all_pages = torch.cat((free_pages, release_pages))
+        else:
+            all_pages = free_pages
+        if all_pages.numel() == 0:
+            return False
+        all_pages = all_pages[all_pages != 0]
+        device = all_pages.device
+        dtype = all_pages.dtype
+        if all_pages.numel() == 0:
+            allocator.free_pages = torch.empty((0,), dtype=dtype, device=device)
+            if release_pages is not None:
+                allocator.release_pages = torch.empty(
+                    (0,), dtype=dtype, device=device
+                )
+            return True
+        unique_pages = torch.unique(all_pages)
+        allocator.free_pages = unique_pages.to(device=device, dtype=dtype)
+        if release_pages is not None:
+            allocator.release_pages = torch.empty((0,), dtype=dtype, device=device)
+        return True
+
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
         ret = 0
         for req in batch.reqs:
@@ -243,6 +298,35 @@ class SchedulerRuntimeCheckerMixin:
             return self._check_radix_cache_memory()
 
         memory_leak, token_msg = _compute_memory_status()
+
+        if memory_leak and getattr(self.tp_worker, "is_nano_pearl", False):
+            try:
+                available_size = self.token_to_kv_pool_allocator.available_size()
+                evictable_size = self.tree_cache.evictable_size()
+            except Exception:
+                available_size = None
+                evictable_size = None
+            if (
+                available_size is not None
+                and evictable_size is not None
+                and available_size + evictable_size > self.max_total_num_tokens
+            ):
+                if self._sanitize_nano_pearl_free_pages():
+                    memory_leak, token_msg = _compute_memory_status()
+                    if not memory_leak:
+                        logger.warning(
+                            "nano-pearl sanitized free page list during idle check."
+                        )
+
+            if memory_leak:
+                reclaimed = self._reclaim_nano_pearl_kv_leak()
+                if reclaimed > 0:
+                    memory_leak, token_msg = _compute_memory_status()
+                    if not memory_leak:
+                        logger.warning(
+                            "nano-pearl reclaimed %d leaked KV slots during idle check.",
+                            reclaimed,
+                        )
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
