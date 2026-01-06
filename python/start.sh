@@ -2,7 +2,7 @@
 
 # cd /home/ubuntu/workspace/jeff/sglang/python
 source .venv/bin/activate 
-# lsof -ti:30000 | xargs kill -9
+# lsof -ti:2333 | xargs kill -9
 ls /dev/shm | grep -E '^(draft_group|target_group)$' >/dev/null 2>&1 && sudo rm -f /dev/shm/draft_group /dev/shm/target_group
 CUDA_VISIBLE_DEVICES=0,1 \
 SGLANG_NANO_PEARL_ALLOW_OVERLAP=1 \
