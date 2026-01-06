@@ -713,6 +713,10 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: bool = False,
     ) -> GenerationBatchResult:
         """Run nano-pearl engine to generate tokens and feed them back to the scheduler."""
+        req_ids = [r.rid for r in model_worker_batch.reqs]
+        if len(req_ids) != len(set(req_ids)):
+            logger.error(f"CRITICAL: Duplicate requests detected in nano-pearl batch! RIDs: {req_ids}")
+        
         if self.pearl_engine is None:
             raise RuntimeError("nano-pearl engine is not initialized.")
 
@@ -730,10 +734,11 @@ class TpModelWorker(BaseTpWorker):
             self._nano_pearl_enqueue_reqs(new_reqs)
 
         def _collect_tokens():
-            self._nano_pearl_wait_for_tokens(model_worker_batch.reqs)
+            # logger.info("DEBUG: Entering _collect_tokens")
             next_token_ids: List[int] = []
             nano_pearl_output_ids: List[List[int]] = []
-            with self._nano_pearl_cv:
+
+            def collect_action():
                 stream_error = self._nano_pearl_stream_error
                 no_engine_active = (
                     not self._nano_pearl_request_queue
@@ -762,10 +767,11 @@ class TpModelWorker(BaseTpWorker):
                                 next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
                                 if req.rid not in self._nano_pearl_missing_token_warned:
+                                    # q_dbg = self._nano_pearl_pending_tokens.get(req.rid)
+                                    # s_dbg = self._nano_pearl_active.get(req.rid)
                                     logger.warning(
-                                        "nano-pearl token queue empty for %s; "
-                                        "using fallback token.",
-                                        req.rid,
+                                        f"nano-pearl token queue empty for {req.rid}; "
+                                        f"using fallback token."
                                     )
                                     self._nano_pearl_missing_token_warned.add(req.rid)
                             continue
@@ -796,6 +802,34 @@ class TpModelWorker(BaseTpWorker):
                         self._nano_pearl_pending_tokens.pop(req.rid, None)
                         if state is not None and state.done:
                             self._nano_pearl_active.pop(req.rid, None)
+
+            self._nano_pearl_wait_for_tokens(model_worker_batch.reqs, action=collect_action)
+            
+            # If wait_for_tokens timed out or errored without running action,
+            # next_token_ids will be empty. We should handle this?
+            # Actually wait_for_tokens only returns on success or timeout. 
+            # If timeout, it logs warning and returns. 
+            # If it returns without action, lists are empty.
+            # We must ensure fallback if lists empty?
+            if not next_token_ids:
+                 # If action wasn't run (e.g. timeout), unblock scheduler with fallbacks?
+                 # Or maybe wait_for_tokens logic handles timeout by returning?
+                 # Wait, wait_for_tokens LOGS timeout but returns anyway?
+                 # No, lines 1195 check timeout, increment hits. Loop continues.
+                 # Line 1205: failsafe for deadlock.
+                 # If deadlock, it attempts kick.
+                 # If it loops forever?
+                 # It assumes it eventually returns.
+                 # But if `stream_error` is set, it returns.
+                 # If stream_error, we should run collect_action to process error!
+                 pass
+            
+            # Re-run collect_action if lists empty to be sure (no lock held now, but fallback)
+            if not next_token_ids:
+                # Use a simplified fallback if action didn't run (rare case: stream error returned immediately)
+                with self._nano_pearl_cv:
+                    collect_action()
+
             return next_token_ids, nano_pearl_output_ids
 
         def _fill_batch_result(batch_result: GenerationBatchResult):
@@ -959,6 +993,7 @@ class TpModelWorker(BaseTpWorker):
             return
 
         def _worker():
+            logger.error("DEBUG_ENGINE: Worker thread started")
             while True:
                 try:
                     while True:
@@ -990,11 +1025,13 @@ class TpModelWorker(BaseTpWorker):
                             continue
 
                         if batch:
+                            logger.error(f"DEBUG_ENGINE: Processing batch with {len(batch)} requests")
                             with self._nano_pearl_lock:
                                 for req in batch:
                                     seq_id = self.pearl_engine.add_request(
                                         req.prompt_ids, req.sampling_params
                                     )
+                                    logger.error(f"DEBUG_ENGINE: Added req {req.rid} as seq_id {seq_id}")
                                     with self._nano_pearl_cv:
                                         self._nano_pearl_seq_id_to_rid[seq_id] = (
                                             req.rid
@@ -1013,7 +1050,9 @@ class TpModelWorker(BaseTpWorker):
                         with self._nano_pearl_cv:
                             has_active = bool(self._nano_pearl_seq_id_to_rid)
                             has_pending = bool(self._nano_pearl_request_queue)
+                        logger.error(f"DEBUG_ENGINE: has_active={has_active} has_pending={has_pending}")
                         if not has_active and not has_pending:
+                            logger.error("DEBUG_ENGINE: Breaking from worker loop (no active/pending)")
                             break
 
                         flush_steps = min(
@@ -1028,6 +1067,7 @@ class TpModelWorker(BaseTpWorker):
                                     if self._nano_pearl_request_queue:
                                         steps = 1
                                 with self._nano_pearl_lock:
+                                    logger.error(f"DEBUG_ENGINE: Calling stream_generate_steps({steps})")
                                     step_result = (
                                         self.pearl_engine.stream_generate_steps(steps)
                                     )
@@ -1036,6 +1076,8 @@ class TpModelWorker(BaseTpWorker):
                                 else:
                                     step_output, step_done = step_result
                                     finished_ids = []
+                                if finished_ids or (step_output and len(step_output) > 0) or step_done:
+                                     logger.error(f"DEBUG_ENGINE: step_done={step_done} finished_ids={finished_ids} outputs={[(s, len(t)) for s,t in step_output]}")
                                 with self._nano_pearl_cv:
                                     for seq_id, token_ids in step_output:
                                         rid = self._nano_pearl_seq_id_to_rid.get(seq_id)
@@ -1147,11 +1189,13 @@ class TpModelWorker(BaseTpWorker):
                 self._nano_pearl_pending_tokens.setdefault(item.rid, deque())
             self._nano_pearl_cv.notify_all()
 
-    def _nano_pearl_wait_for_tokens(self, reqs):
+    def _nano_pearl_wait_for_tokens(self, reqs, action=None):
         timeout = self._nano_pearl_wait_timeout_s
         if any(req.stream for req in reqs):
             timeout = min(timeout, self._nano_pearl_stream_wait_timeout_s)
         require_all_ready = not self.server_args.disable_overlap_schedule
+        if self._nano_pearl_wait_timeout_hits == 0:
+             logger.info(f"DEBUG: wait_for_tokens timeout={timeout} require_all_ready={require_all_ready}")
         deadline = time.monotonic() + timeout
         with self._nano_pearl_cv:
             while True:
@@ -1179,6 +1223,8 @@ class TpModelWorker(BaseTpWorker):
                             break
                     if all_ready:
                         self._nano_pearl_wait_timeout_hits = 0
+                        if action:
+                            action()
                         return
                     if timeout > 0 and time.monotonic() >= deadline:
                         now = time.monotonic()
