@@ -2512,6 +2512,7 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        aborted_rids: set[str] = set()
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2524,6 +2525,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            aborted_rids.add(req.rid)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -2547,6 +2549,7 @@ class Scheduler(
                 if req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+                aborted_rids.add(req.rid)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2556,6 +2559,7 @@ class Scheduler(
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    aborted_rids.add(req.rid)
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -2563,6 +2567,7 @@ class Scheduler(
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    aborted_rids.add(req.rid)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
@@ -2570,12 +2575,14 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    aborted_rids.add(decode_req.req.rid)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    aborted_rids.add(decode_req.req.rid)
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -2592,6 +2599,14 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                aborted_rids.add(req.rid)
+
+        if getattr(self.tp_worker, "is_nano_pearl", False):
+            if recv_req.abort_all:
+                self.tp_worker.cancel_all_nano_pearl_requests()
+            else:
+                for rid in aborted_rids:
+                    self.tp_worker.cancel_nano_pearl_request(rid)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

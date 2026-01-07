@@ -565,6 +565,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(
                         req, self.tree_cache, is_insert=not use_nano_pearl
                     )
+                if use_nano_pearl:
+                    self.tp_worker.cleanup_nano_pearl_request(req.rid)
 
                 req.time_stats.completion_time = time.perf_counter()
 

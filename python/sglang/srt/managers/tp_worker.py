@@ -507,11 +507,13 @@ class TpModelWorker(BaseTpWorker):
         self._nano_pearl_request_queue: Deque[NanoPearlQueuedRequest] = deque()
         self._nano_pearl_worker_thread: Optional[threading.Thread] = None
         self._nano_pearl_worker_shutdown = False
+        self._nano_pearl_worker_has_batch = False
         self._nano_pearl_stream_error: Optional[BaseException] = None
         self._nano_pearl_max_num_batched_tokens: Optional[int] = None
         self._nano_pearl_max_num_seqs: Optional[int] = None
         self._nano_pearl_invalid_token_warned: set[str] = set()
         self._nano_pearl_missing_token_warned: set[str] = set()
+        self._nano_pearl_cancelled: set[str] = set()
         self._nano_pearl_wait_timeout_s = float(
             os.getenv("NANO_PEARL_SGLANG_WAIT_TIMEOUT_S", "5")
         )
@@ -968,6 +970,23 @@ class TpModelWorker(BaseTpWorker):
                                 and not self._nano_pearl_seq_id_to_rid
                                 and not self._nano_pearl_worker_shutdown
                             ):
+                                if self._nano_pearl_cancelled:
+                                    active = set(self._nano_pearl_active)
+                                    queued = {
+                                        item.rid
+                                        for item in self._nano_pearl_request_queue
+                                    }
+                                    pending = set(self._nano_pearl_pending_tokens)
+                                    safe = (
+                                        self._nano_pearl_cancelled
+                                        - active
+                                        - queued
+                                        - pending
+                                    )
+                                    if safe:
+                                        self._nano_pearl_cancelled.difference_update(
+                                            safe
+                                        )
                                 self._nano_pearl_cv.wait()
                             if self._nano_pearl_worker_shutdown:
                                 return
@@ -975,6 +994,7 @@ class TpModelWorker(BaseTpWorker):
                             self._nano_pearl_request_queue.clear()
                             if batch:
                                 self._nano_pearl_stream_error = None
+                            self._nano_pearl_worker_has_batch = bool(batch)
 
                         if self.pearl_engine is None:
                             with self._nano_pearl_cv:
@@ -986,10 +1006,50 @@ class TpModelWorker(BaseTpWorker):
                                     if state is not None:
                                         state.done = True
                                 self._nano_pearl_seq_id_to_rid.clear()
+                                self._nano_pearl_worker_has_batch = False
                                 self._nano_pearl_cv.notify_all()
                             continue
 
                         if batch:
+                            if self._nano_pearl_cancelled:
+                                with self._nano_pearl_cv:
+                                    cancelled = set(self._nano_pearl_cancelled)
+                                if cancelled:
+                                    skipped = {
+                                        req.rid for req in batch if req.rid in cancelled
+                                    }
+                                    if skipped:
+                                        batch = [
+                                            req
+                                            for req in batch
+                                            if req.rid not in cancelled
+                                        ]
+                                        with self._nano_pearl_cv:
+                                            for rid in skipped:
+                                                self._nano_pearl_cancelled.discard(rid)
+                            if not batch:
+                                with self._nano_pearl_cv:
+                                    self._nano_pearl_worker_has_batch = False
+                                    if self._nano_pearl_cancelled:
+                                        active = set(self._nano_pearl_active)
+                                        queued = {
+                                            item.rid
+                                            for item in self._nano_pearl_request_queue
+                                        }
+                                        pending = set(
+                                            self._nano_pearl_pending_tokens
+                                        )
+                                        safe = (
+                                            self._nano_pearl_cancelled
+                                            - active
+                                            - queued
+                                            - pending
+                                        )
+                                        if safe:
+                                            self._nano_pearl_cancelled.difference_update(
+                                                safe
+                                            )
+                                continue
                             with self._nano_pearl_lock:
                                 for req in batch:
                                     seq_id = self.pearl_engine.add_request(
@@ -1009,6 +1069,25 @@ class TpModelWorker(BaseTpWorker):
                                         self._nano_pearl_pending_tokens.setdefault(
                                             req.rid, deque()
                                         )
+                            with self._nano_pearl_cv:
+                                self._nano_pearl_worker_has_batch = False
+                                if self._nano_pearl_cancelled:
+                                    active = set(self._nano_pearl_active)
+                                    queued = {
+                                        item.rid
+                                        for item in self._nano_pearl_request_queue
+                                    }
+                                    pending = set(self._nano_pearl_pending_tokens)
+                                    safe = (
+                                        self._nano_pearl_cancelled
+                                        - active
+                                        - queued
+                                        - pending
+                                    )
+                                    if safe:
+                                        self._nano_pearl_cancelled.difference_update(
+                                            safe
+                                        )
 
                         with self._nano_pearl_cv:
                             has_active = bool(self._nano_pearl_seq_id_to_rid)
@@ -1020,7 +1099,15 @@ class TpModelWorker(BaseTpWorker):
                             self._nano_pearl_prefetch_flush_steps,
                             self._nano_pearl_prefetch_steps,
                         )
-                        if self._nano_pearl_use_stream_steps:
+                        with self._nano_pearl_cv:
+                            has_streaming = any(
+                                state is not None and state.is_stream
+                                for state in self._nano_pearl_active.values()
+                            )
+                        use_stream_steps = (
+                            self._nano_pearl_use_stream_steps or not has_streaming
+                        )
+                        if use_stream_steps:
                             steps_left = self._nano_pearl_prefetch_steps
                             while steps_left > 0:
                                 steps = min(flush_steps, steps_left)
@@ -1350,6 +1437,56 @@ class TpModelWorker(BaseTpWorker):
             )
             self._nano_pearl_invalid_token_warned.add(req.rid)
         return sanitized
+
+    def cancel_nano_pearl_request(self, rid: str) -> None:
+        if not self.is_nano_pearl:
+            return
+        seq_id = None
+        with self._nano_pearl_cv:
+            self._nano_pearl_cancelled.add(rid)
+            state = self._nano_pearl_active.get(rid)
+            if state is not None:
+                seq_id = state.seq_id
+        if seq_id is not None and self.pearl_engine is not None:
+            with self._nano_pearl_lock:
+                try:
+                    self.pearl_engine.cancel_request(seq_id)
+                except Exception as exc:
+                    logger.warning(
+                        "nano-pearl cancel failed for %s: %s", rid, exc
+                    )
+            with self._nano_pearl_cv:
+                self._nano_pearl_cancelled.discard(rid)
+        self.cleanup_nano_pearl_request(rid)
+
+    def cancel_all_nano_pearl_requests(self) -> None:
+        if not self.is_nano_pearl:
+            return
+        with self._nano_pearl_cv:
+            rids = set(self._nano_pearl_active.keys())
+            rids.update(item.rid for item in self._nano_pearl_request_queue)
+            rids.update(self._nano_pearl_pending_tokens.keys())
+        for rid in rids:
+            self.cancel_nano_pearl_request(rid)
+
+    def cleanup_nano_pearl_request(self, rid: str) -> None:
+        if not self.is_nano_pearl:
+            return
+        with self._nano_pearl_cv:
+            if self._nano_pearl_request_queue:
+                self._nano_pearl_request_queue = deque(
+                    item
+                    for item in self._nano_pearl_request_queue
+                    if item.rid != rid
+                )
+            state = self._nano_pearl_active.pop(rid, None)
+            if state is not None:
+                self._nano_pearl_seq_id_to_rid.pop(state.seq_id, None)
+            self._nano_pearl_pending_tokens.pop(rid, None)
+            self._nano_pearl_generated.discard(rid)
+            self._nano_pearl_invalid_token_warned.discard(rid)
+            self._nano_pearl_missing_token_warned.discard(rid)
+            self._nano_pearl_cv.notify_all()
 
     def get_remote_instance_transfer_engine_info(self):
         return (
