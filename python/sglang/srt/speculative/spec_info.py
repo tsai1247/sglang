@@ -173,6 +173,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_slrs(self) -> bool:
+        return self._has_flag("SLRS")
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "SLRS": lambda algorithm: SpeculativeAlgorithm._add_flag("SLRS", algorithm),
 }
 
 
@@ -285,6 +289,12 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
     return NGRAMWorker(**kwargs)
 
 
+def _create_slrs_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.slrs_worker import SLRSWorker
+
+    return SLRSWorker(**kwargs)
+
+
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
 # call `register_speculative_algorithm` or use the helpers below to attach
@@ -314,6 +324,12 @@ register_speculative_algorithm(
     "NGRAM",
     worker_cls=_create_ngram_worker,
     flags=("NGRAM",),
+)
+
+register_speculative_algorithm(
+    "SLRS",
+    worker_cls=_create_slrs_worker,
+    flags=("SLRS",),
 )
 
 

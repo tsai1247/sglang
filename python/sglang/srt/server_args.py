@@ -1945,6 +1945,29 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "SLRS":
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+
+            if self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = self.model_path
+                self.speculative_draft_model_revision = self.revision
+
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = 1
+            elif self.speculative_num_draft_tokens != 1:
+                logger.warning(
+                    "SLRS currently supports speculative_num_draft_tokens=1. "
+                    "Overriding to 1."
+                )
+                self.speculative_num_draft_tokens = 1
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3323,7 +3346,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SLRS"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
