@@ -760,13 +760,12 @@ class TpModelWorker(BaseTpWorker):
                                 next_token_ids.append(token_id)
                                 nano_pearl_output_ids.append([])
                             else:
-                                token_id = self._nano_pearl_fallback_token(req)
-                                next_token_ids.append(token_id)
+                                next_token_ids.append(-1)
                                 nano_pearl_output_ids.append([])
                                 if req.rid not in self._nano_pearl_missing_token_warned:
                                     logger.warning(
                                         "nano-pearl token queue empty for %s; "
-                                        "using fallback token.",
+                                        "skipping output until tokens are ready.",
                                         req.rid,
                                     )
                                     self._nano_pearl_missing_token_warned.add(req.rid)

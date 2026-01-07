@@ -25,3 +25,7 @@ Fixes applied:
    - Aborted requests now notify nano-pearl to drop the matching seq_id, preventing wasted GPU work on requests that the scheduler has already terminated.
    - Paths: python/sglang/srt/managers/scheduler.py, python/sglang/srt/managers/tp_worker.py
    - nano-PEARL hooks: python/nano-PEARL/nano_pearl/pearl_engine/pearl_engine.py, python/nano-PEARL/nano_pearl/pearl_engine/pearl_model_runner.py, python/nano-PEARL/nano_pearl/pearl_engine/scheduler.py
+
+4) Avoid emitting fallback tokens when nano-pearl is still running.
+   - If a request has no tokens ready but the nano-pearl engine is still active, we now return a sentinel to skip output rather than injecting an EOS fallback token, preventing truncated responses under load.
+   - Path: python/sglang/srt/managers/tp_worker.py
