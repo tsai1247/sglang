@@ -2244,6 +2244,9 @@ class ModelWorkerBatch:
 
     spec_info: Optional[SpecInput] = None
 
+    # Optional vocab subset for partial logits
+    vocab_subset: Optional[torch.Tensor] = None
+
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1

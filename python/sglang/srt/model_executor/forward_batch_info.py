@@ -372,6 +372,9 @@ class ForwardBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # Optional vocab subset for partial logits
+    vocab_subset: Optional[torch.Tensor] = None
+
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -434,6 +437,7 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
+            vocab_subset=batch.vocab_subset,
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,

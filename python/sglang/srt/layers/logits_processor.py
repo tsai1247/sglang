@@ -119,6 +119,9 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
+    # Optional vocab subset for partial logits
+    vocab_subset: Optional[torch.Tensor] = None
+
     # logits and logprobs post processing
     temp_scaled_logprobs: bool = False
     temperature: torch.Tensor = None
@@ -186,6 +189,7 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
             is_prefill_only=forward_batch.is_prefill_only,
+            vocab_subset=forward_batch.vocab_subset,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -859,6 +863,64 @@ class LogitsProcessor(nn.Module):
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+
+        vocab_subset = logits_metadata.vocab_subset
+        if vocab_subset is not None:
+            if self.do_tensor_parallel_all_gather or self.do_tensor_parallel_all_gather_dp_attn:
+                logger.warning(
+                    "Vocab subset logits are not supported with tensor parallel gather; "
+                    "falling back to full logits."
+                )
+                vocab_subset = None
+            elif not hasattr(lm_head, "weight"):
+                logger.warning(
+                    "Vocab subset logits are only supported for lm_head with weight; "
+                    "falling back to full logits."
+                )
+                vocab_subset = None
+            elif hidden_states.dim() != 2 or hidden_states.shape[0] != vocab_subset.shape[0]:
+                logger.warning(
+                    "Vocab subset logits require 2D hidden states matching batch size; "
+                    "falling back to full logits."
+                )
+                vocab_subset = None
+
+        if vocab_subset is not None:
+            if vocab_subset.device != hidden_states.device:
+                vocab_subset = vocab_subset.to(hidden_states.device, non_blocking=True)
+            invalid_mask = vocab_subset < 0
+            vocab_subset = vocab_subset.clamp_min(0)
+
+            weight = lm_head.weight
+            if self.use_fp32_lm_head:
+                weight = weight.to(torch.float32)
+                hidden_states = hidden_states.to(torch.float32)
+            else:
+                hidden_states = hidden_states.to(weight.dtype)
+
+            flat_ids = vocab_subset.reshape(-1)
+            selected_weight = weight.index_select(0, flat_ids).view(
+                vocab_subset.shape[0], vocab_subset.shape[1], weight.shape[1]
+            )
+            logits = torch.einsum("bkh,bh->bk", selected_weight, hidden_states)
+            bias = getattr(lm_head, "bias", None)
+            if bias is not None:
+                logits = logits + bias[vocab_subset]
+            if invalid_mask.any():
+                logits = logits.masked_fill(invalid_mask, float("-inf"))
+
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+
+            logits = logits.float()
+            if self.final_logit_softcapping:
+                if not _is_npu:
+                    fused_softcap(logits, self.final_logit_softcapping)
+                else:
+                    logits = self.final_logit_softcapping * torch.tanh(
+                        logits / self.final_logit_softcapping
+                    )
+            return logits
 
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

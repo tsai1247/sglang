@@ -4,8 +4,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import get_top_logprobs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -24,6 +23,7 @@ if is_cuda() or is_hip():
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+SLRS_TOPK = 50
 
 
 def _top_k_renorm_prob_fallback(
@@ -132,7 +132,8 @@ class SLRSWorker:
         )
 
         self.target_vocab_size = target_worker.model_runner.model_config.vocab_size
-        self.draft_vocab_size = self.draft_tokenizer.vocab_size
+        self.draft_vocab_size = self.model_config.vocab_size
+        self.draft_tokenizer_vocab_size = self.draft_tokenizer.vocab_size
 
         self._draft_to_target = self._build_draft_to_target_map()
         self._draft_to_target_valid = (self._draft_to_target >= 0).nonzero(
@@ -166,11 +167,16 @@ class SLRSWorker:
         mapping = [-1] * self.draft_vocab_size
         target_tokenizer = self.target_worker.tokenizer
         for token_id in range(self.draft_vocab_size):
-            text = self.draft_tokenizer.decode(
-                [token_id],
-                skip_special_tokens=True,
-                spaces_between_special_tokens=True,
-            )
+            if token_id >= self.draft_tokenizer_vocab_size:
+                continue
+            try:
+                text = self.draft_tokenizer.decode(
+                    [token_id],
+                    skip_special_tokens=True,
+                    spaces_between_special_tokens=True,
+                )
+            except Exception:
+                continue
             if not text:
                 continue
             target_ids = target_tokenizer.encode(text, add_special_tokens=False)
@@ -298,21 +304,7 @@ class SLRSWorker:
             return self.target_worker.forward_batch_generation(model_worker_batch)
 
         self._ensure_decode_prepared(batch)
-
-        # Target logits for p(t | context).
-        model_worker_batch = batch.get_model_worker_batch()
-        target_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
-        logits_output = target_result.logits_output
         sampling_info = batch.sampling_info
-
-        # Apply custom logit processors and penalties on target logits.
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(
-                logits_output.next_token_logits, sampling_info, num_tokens_in_batch=1
-            )
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
         # Draft logits for q(d | context) using a fresh prefill batch.
         draft_batch = self._build_draft_batch(batch)
@@ -326,56 +318,116 @@ class SLRSWorker:
         for req in draft_batch.reqs:
             release_kv_cache(req, self.draft_tree_cache, is_insert=False)
 
-        # Compute proposal and target distributions.
-        draft_probs = self._compute_probs(draft_logits, sampling_info)
-        target_probs = self._compute_probs(
-            logits_output.next_token_logits, sampling_info
+        topk = min(SLRS_TOPK, draft_logits.shape[-1])
+        draft_topk_ids = torch.topk(draft_logits, k=topk, dim=-1).indices
+        draft_to_target, _, _ = self._get_draft_to_target_device(draft_logits.device)
+        target_candidates = draft_to_target[draft_topk_ids]
+
+        vocab_subset_rows: List[List[int]] = []
+        target_candidates_cpu = target_candidates.tolist()
+        for row in target_candidates_cpu:
+            seen = set()
+            unique_row = []
+            for token_id in row:
+                if token_id < 0:
+                    continue
+                if token_id in seen:
+                    continue
+                seen.add(token_id)
+                unique_row.append(token_id)
+                if len(unique_row) >= SLRS_TOPK:
+                    break
+            if not unique_row:
+                fallback_id = (
+                    self.target_worker.tokenizer.eos_token_id
+                    if self.target_worker.tokenizer is not None
+                    and self.target_worker.tokenizer.eos_token_id is not None
+                    else 0
+                )
+                logger.warning(
+                    "SLRS draft mapping produced no candidates; using fallback token."
+                )
+                unique_row.append(fallback_id)
+            while len(unique_row) < SLRS_TOPK:
+                unique_row.append(-1)
+            vocab_subset_rows.append(unique_row)
+
+        vocab_subset = torch.tensor(
+            vocab_subset_rows, dtype=torch.int64, device=self.device
         )
-        psi = self._compute_psi(draft_probs, self.target_vocab_size)
 
-        # Sample draft tokens.
-        draft_sampled = torch.multinomial(draft_probs, num_samples=1).squeeze(1)
-        draft_sampled_cpu = draft_sampled.tolist()
+        # Target logits for candidates only.
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.vocab_subset = vocab_subset
+        target_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output = target_result.logits_output
+        subset_logits = logits_output.next_token_logits
 
-        accepted_token_ids: List[int] = []
-        for i, req in enumerate(batch.reqs):
-            text = self.draft_tokenizer.decode(
-                [draft_sampled_cpu[i]],
-                skip_special_tokens=True,
-                spaces_between_special_tokens=True,
+        if subset_logits is None:
+            raise RuntimeError("SLRS target logits are missing.")
+
+        if subset_logits.shape[1] != vocab_subset.shape[1]:
+            logger.warning(
+                "SLRS received full logits; gathering vocab_subset for verification."
             )
-            if not text:
-                candidate = None
-            else:
-                target_ids = req.tokenizer.encode(text, add_special_tokens=False)
-                candidate = target_ids[0] if target_ids else None
+            clamped_subset = vocab_subset.clamp_min(0)
+            subset_logits = subset_logits.gather(1, clamped_subset)
+            invalid_mask = vocab_subset < 0
+            if invalid_mask.any():
+                subset_logits = subset_logits.masked_fill(invalid_mask, float("-inf"))
+            logits_output.next_token_logits = subset_logits
 
-            if candidate is None or candidate >= self.target_vocab_size:
-                # Fall back to target sampling.
-                token_id = torch.multinomial(target_probs[i], num_samples=1).item()
-                accepted_token_ids.append(token_id)
-                continue
+        clamped_subset = vocab_subset.clamp_min(0)
+        invalid_mask = vocab_subset < 0
 
-            p_val = target_probs[i, candidate].item()
-            psi_val = psi[i, candidate].item()
-            if psi_val <= 0 or p_val >= psi_val:
-                accept = True
+        if sampling_info.has_custom_logit_processor:
+            logger.warning(
+                "SLRS vocab subset does not support custom logit processors; skipping."
+            )
+
+        if sampling_info.penalizer_orchestrator.is_required:
+            penalty = torch.zeros(
+                (subset_logits.shape[0], sampling_info.vocab_size),
+                dtype=torch.float32,
+                device=subset_logits.device,
+            )
+            sampling_info.penalizer_orchestrator.apply(penalty)
+            subset_logits = subset_logits + penalty.gather(1, clamped_subset)
+
+        sampling_info.update_regex_vocab_mask()
+        if sampling_info.vocab_mask is not None:
+            vocab_mask = sampling_info.vocab_mask
+            if (
+                vocab_mask.ndim == 2
+                and vocab_mask.shape[0] == subset_logits.shape[0]
+                and vocab_mask.shape[1] == sampling_info.vocab_size
+            ):
+                if vocab_mask.device != subset_logits.device:
+                    vocab_mask = vocab_mask.to(subset_logits.device, non_blocking=True)
+                subset_mask = vocab_mask.gather(1, clamped_subset)
+                subset_logits = subset_logits.masked_fill(subset_mask, float("-inf"))
             else:
-                accept = torch.rand((), device=target_probs.device).item() < (
-                    p_val / psi_val
+                logger.warning(
+                    "SLRS vocab subset does not support this grammar mask; skipping."
                 )
 
-            if accept:
-                accepted_token_ids.append(candidate)
-            else:
-                residual = target_probs[i] - torch.minimum(target_probs[i], psi[i])
-                residual_sum = residual.sum().item()
-                if residual_sum <= 0:
-                    token_id = torch.multinomial(target_probs[i], num_samples=1).item()
-                else:
-                    residual = residual / residual_sum
-                    token_id = torch.multinomial(residual, num_samples=1).item()
-                accepted_token_ids.append(token_id)
+        if sampling_info.logit_bias is not None:
+            logit_bias = sampling_info.logit_bias
+            if logit_bias.device != subset_logits.device:
+                logit_bias = logit_bias.to(subset_logits.device, non_blocking=True)
+            subset_logits = subset_logits + logit_bias.gather(1, clamped_subset)
+
+        if invalid_mask.any():
+            subset_logits = subset_logits.masked_fill(invalid_mask, float("-inf"))
+
+        logits_output.next_token_logits = subset_logits
+
+        accepted_token_ids: List[int] = []
+        best_indices = torch.argmax(subset_logits, dim=-1)
+        for i, best_idx in enumerate(best_indices.tolist()):
+            accepted_token_ids.append(vocab_subset[i, best_idx].item())
 
         if sampling_info.penalizer_orchestrator.is_required:
             sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -384,21 +436,41 @@ class SLRSWorker:
 
         if batch.return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
-                logprobs = torch.nn.functional.log_softmax(
-                    logits_output.next_token_logits, dim=-1
-                )
+                logprobs = torch.nn.functional.log_softmax(subset_logits, dim=-1)
             else:
-                logprobs = torch.nn.functional.log_softmax(
-                    logits_output.next_token_logits / sampling_info.temperatures, dim=-1
-                )
+                logprobs = torch.nn.functional.log_softmax(subset_logits, dim=-1)
             top_logprobs = None
             token_ids_logprobs = None
             if any(x > 0 for x in batch.top_logprobs_nums):
                 top_logprobs = get_top_logprobs(logprobs, batch.top_logprobs_nums)
+                top_vals, top_indices = top_logprobs
+                mapped_top_indices = []
+                for row_idx, row in enumerate(top_indices):
+                    mapped_top_indices.append(
+                        [vocab_subset_rows[row_idx][j] for j in row]
+                    )
+                top_logprobs = (top_vals, mapped_top_indices)
             if any(x is not None for x in batch.token_ids_logprobs):
-                token_ids_logprobs = get_token_ids_logprobs(
-                    logprobs, batch.token_ids_logprobs
-                )
+                token_ids_logprobs = ([], [])
+                for row_idx, token_ids in enumerate(batch.token_ids_logprobs):
+                    if token_ids is None:
+                        token_ids_logprobs[0].append([])
+                        token_ids_logprobs[1].append([])
+                        continue
+                    row_map = {
+                        token_id: pos
+                        for pos, token_id in enumerate(vocab_subset_rows[row_idx])
+                        if token_id >= 0
+                    }
+                    row_vals = []
+                    for token_id in token_ids:
+                        pos = row_map.get(token_id)
+                        if pos is None:
+                            row_vals.append(float("-inf"))
+                        else:
+                            row_vals.append(logprobs[row_idx, pos].item())
+                    token_ids_logprobs[0].append(row_vals)
+                    token_ids_logprobs[1].append(token_ids)
 
         for i, (req, token_id) in enumerate(zip(batch.reqs, accepted_token_ids)):
             req.output_ids.append(token_id)
@@ -409,7 +481,9 @@ class SLRSWorker:
             req.spec_verify_ct += 1
 
             if batch.return_logprob:
-                req.output_token_logprobs_val.append(logprobs[i, token_id].item())
+                req.output_token_logprobs_val.append(
+                    logprobs[i, best_indices[i]].item()
+                )
                 req.output_token_logprobs_idx.append(token_id)
                 if req.top_logprobs_num > 0 and top_logprobs is not None:
                     req.output_top_logprobs_val.append(top_logprobs[0][i])

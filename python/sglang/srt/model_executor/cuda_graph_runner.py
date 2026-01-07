@@ -371,6 +371,8 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if forward_batch.vocab_subset is not None:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
