@@ -1,4 +1,5 @@
 import json
+import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
@@ -11,6 +12,8 @@ MODEL_ID = "/home/ubuntu/models/Qwen/Qwen3-0.6B"
 
 # 為了節省記憶體，建議使用 4-bit 量化載入 (需要安裝 bitsandbytes)
 LOAD_IN_4BIT = False 
+# 生成步數 (每次輸入預設生成 50 個 token)
+NUM_STEPS = 50
 # -------------------------------------
 
 print(f"正在載入模型: {MODEL_ID} ... (這可能需要一點時間)")
@@ -33,20 +36,18 @@ else:
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
 
-def get_next_token_candidates(prompt_text):
-    
-    # 3. 處理輸入
-    print(f"\n輸入 Prompt: '{prompt_text}'")
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-    input_ids = inputs["input_ids"][0].tolist()
+def get_next_token_candidates(input_ids):
     input_tokens = tokenizer.convert_ids_to_tokens(input_ids)
     print(f"輸入 Token IDs: {input_ids}")
     print(f"輸入 Tokens: {input_tokens}")
 
+    input_tensor = torch.tensor([input_ids], device=model.device)
+    attention_mask = torch.ones_like(input_tensor)
+
     # 4. 前向傳播 (Forward Pass) 獲取 Logits
     # 我們不需要計算梯度，使用 torch.no_grad() 節省記憶體
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = model(input_ids=input_tensor, attention_mask=attention_mask)
         # 獲取最後一個 token 的 logits (預測下一個字)
         next_token_logits = outputs.logits[0, -1, :]
 
@@ -91,26 +92,34 @@ if __name__ == "__main__":
     while True:
         my_prompt = input("prompt> ")
         try:
-            candidates_list, candidates_json, output_token, output_value, input_tokens = get_next_token_candidates(my_prompt)
-            
-            # 顯示結果
-            df = pd.DataFrame(candidates_list)
-            print("\n=== 下一個 Token 的前 50 個候選 ===")
-            print(df.to_string(index=False))
-            
-            print("\n" + "="*40)
-            print(f"模型決定的下一個 Token 是: '{output_value}'")
-            print("="*40)
-            
-            record = {
-                "prompt": my_prompt,
-                "input_tokens": input_tokens,
-                "candidates": candidates_json,
-                "output_token": output_token,
-                "output_value": output_value,
-            }
+            input_ids = tokenizer(my_prompt, return_tensors="pt")["input_ids"][0].tolist()
             with open("tmp.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for step in range(NUM_STEPS):
+                    current_prompt = tokenizer.decode(input_ids)
+                    print(f"\n=== Step {step + 1}/{NUM_STEPS} ===")
+                    print(f"輸入 Prompt: '{current_prompt}'")
+
+                    candidates_list, candidates_json, output_token, output_value, input_tokens = get_next_token_candidates(input_ids)
+
+                    # 顯示結果
+                    df = pd.DataFrame(candidates_list)
+                    print("\n=== 下一個 Token 的前 50 個候選 ===")
+                    print(df.to_string(index=False))
+
+                    print("\n" + "="*40)
+                    print(f"模型決定的下一個 Token 是: '{output_value}'")
+                    print("="*40)
+
+                    record = {
+                        "prompt": current_prompt,
+                        "input_tokens": input_tokens,
+                        "candidates": candidates_json,
+                        "output_token": output_token,
+                        "output_value": output_value,
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                    input_ids.append(output_token)
             
         except Exception as e:
             print(f"發生錯誤: {e}")
