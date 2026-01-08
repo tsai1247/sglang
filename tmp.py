@@ -1,5 +1,4 @@
 import json
-import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
@@ -13,7 +12,9 @@ MODEL_ID = "/home/ubuntu/models/Qwen/Qwen3-0.6B"
 # 為了節省記憶體，建議使用 4-bit 量化載入 (需要安裝 bitsandbytes)
 LOAD_IN_4BIT = False 
 # 生成步數 (每次輸入預設生成 50 個 token)
-NUM_STEPS = 50
+NUM_STEPS = 10
+# 資料來源
+DATA_PATH = "./data.json"
 # -------------------------------------
 
 print(f"正在載入模型: {MODEL_ID} ... (這可能需要一點時間)")
@@ -87,40 +88,46 @@ def get_next_token_candidates(input_ids):
 
 # --- 執行程式 ---
 if __name__ == "__main__":
-    # 在這裡輸入您的測試 Prompt
-    # my_prompt = "人工智慧未來的發展將會是"
-    while True:
-        my_prompt = input("prompt> ")
-        try:
-            input_ids = tokenizer(my_prompt, return_tensors="pt")["input_ids"][0].tolist()
-            with open("tmp.jsonl", "a", encoding="utf-8") as f:
-                for step in range(NUM_STEPS):
-                    current_prompt = tokenizer.decode(input_ids)
-                    print(f"\n=== Step {step + 1}/{NUM_STEPS} ===")
-                    print(f"輸入 Prompt: '{current_prompt}'")
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        all_data = json.load(f)
 
-                    candidates_list, candidates_json, output_token, output_value, input_tokens = get_next_token_candidates(input_ids)
+    for i, item in enumerate(all_data):
+        for j, convo in enumerate(item.get("conversations", [])):
+            if convo.get("from") != "human":
+                continue
+            my_prompt = convo.get("value", "")
+            if not my_prompt:
+                continue
+            try:
+                input_ids = tokenizer(my_prompt, return_tensors="pt")["input_ids"][0].tolist()
+                with open("tmp.jsonl", "a", encoding="utf-8") as f:
+                    for step in range(NUM_STEPS):
+                        current_prompt = tokenizer.decode(input_ids)
+                        print(f"\n=== Item {i} Convo {j} Step {step + 1}/{NUM_STEPS} ===")
+                        print(f"輸入 Prompt: '{current_prompt}'")
 
-                    # 顯示結果
-                    df = pd.DataFrame(candidates_list)
-                    print("\n=== 下一個 Token 的前 50 個候選 ===")
-                    print(df.to_string(index=False))
+                        candidates_list, candidates_json, output_token, output_value, input_tokens = get_next_token_candidates(input_ids)
 
-                    print("\n" + "="*40)
-                    print(f"模型決定的下一個 Token 是: '{output_value}'")
-                    print("="*40)
+                        # 顯示結果
+                        df = pd.DataFrame(candidates_list)
+                        print("\n=== 下一個 Token 的前 50 個候選 ===")
+                        print(df.to_string(index=False))
 
-                    record = {
-                        "prompt": current_prompt,
-                        "input_tokens": input_tokens,
-                        "candidates": candidates_json,
-                        "output_token": output_token,
-                        "output_value": output_value,
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        print("\n" + "="*40)
+                        print(f"模型決定的下一個 Token 是: '{output_value}'")
+                        print("="*40)
 
-                    input_ids.append(output_token)
-            
-        except Exception as e:
-            print(f"發生錯誤: {e}")
-            print("提示: 請確認您的 VRAM 足夠，或已安裝 bitsandbytes, accelerate 等套件。")
+                        record = {
+                            "prompt": current_prompt,
+                            "input_tokens": input_tokens,
+                            "candidates": candidates_json,
+                            "output_token": output_token,
+                            "output_value": output_value,
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                        input_ids.append(output_token)
+
+            except Exception as e:
+                print(f"發生錯誤: {e}")
+                print("提示: 請確認您的 VRAM 足夠，或已安裝 bitsandbytes, accelerate 等套件。")

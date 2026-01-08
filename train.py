@@ -93,4 +93,4 @@ for sample in dataset_samples:
     candidates = sample["negs"] # 實際會有100個
     candidates.append(sample["pos"])
     result, score = predict_best_candidate(input_text, candidates)
-    print(f"最佳匹配: {result} (Score: {score:.4f})")
+    print(f"best: {result} (Score: {score:.4f})")
