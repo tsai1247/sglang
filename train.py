@@ -19,10 +19,35 @@ train_examples = []
 
 # 假設你有一筆數據: input="專利A", correct="半導體", wrongs=["面板", "生技"...]
 # 為了效率，通常比例是 1個正樣本 : N個負樣本 (例如 1:4)
-dataset_samples = [
-    {"q": "專利摘要：一種高效能的FinFET...", "pos": "半導體製程", "negs": ["生物科技", "面板顯示", "化工製程"]},
+# dataset_samples = [
+    # {"q": "專利摘要：一種高效能的FinFET...", "pos": "半導體製程", "negs": ["生物科技", "面板顯示", "化工製程"]},
     # ... 更多數據
-]
+# ]
+
+data = []
+import json
+with open('tmp.jsonl', 'r', encoding='utf-8') as f:
+    for line in f:
+        # 跳過空行或處理錯誤
+        if line.strip():
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"解析錯誤: {e}")
+
+dataset_samples = []
+for content in data:
+    q = content['prompt']
+    pos = content['output_value']
+    negs = []
+    for candidate in content['candidates']:
+        if candidate["value"] != pos:
+            negs.append(candidate["value"])
+    dataset_samples.append({
+        "q": q,
+        "pos": pos,
+        "negs": negs
+    })
 
 for item in dataset_samples:
     # 正樣本
@@ -37,7 +62,7 @@ train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=32)
 # --- 3. 訓練 ---
 # 這裡不需要特殊的 RankingLoss，因為我們把它轉化成了二元分類/回歸問題
 # 但模型學會的是：給定 (Input, Cand)，判斷它們的匹配程度
-num_epochs = 3
+num_epochs = 20
 warmup_steps = int(len(train_dataloader) * num_epochs * 0.1)
 
 model.fit(
@@ -58,11 +83,12 @@ def predict_best_candidate(input_text, candidates_list):
     scores = model.predict(pairs) # 返回 array([0.9, 0.1, 0.05 ...])
     
     # 找出最高分的 index
+    print("scores", scores)
     best_idx = scores.argmax()
     return candidates_list[best_idx], scores[best_idx]
 
 # 測試
-input_text = "專利摘要：一種高效能的FinFET..."
-candidates = ["生物科技", "半導體製程", "面板顯示"] # 實際會有100個
+input_text = "Hello, how are "
+candidates = ["2", "you", "3", "1"] # 實際會有100個
 result, score = predict_best_candidate(input_text, candidates)
 print(f"最佳匹配: {result} (Score: {score:.4f})")
