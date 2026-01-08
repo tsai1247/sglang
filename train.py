@@ -83,12 +83,14 @@ def predict_best_candidate(input_text, candidates_list):
     scores = model.predict(pairs) # 返回 array([0.9, 0.1, 0.05 ...])
     
     # 找出最高分的 index
-    print("scores", scores)
+    # print("scores", scores)
     best_idx = scores.argmax()
     return candidates_list[best_idx], scores[best_idx]
 
 # 測試
-input_text = "Hello, how are "
-candidates = ["2", "you", "3", "1"] # 實際會有100個
-result, score = predict_best_candidate(input_text, candidates)
-print(f"最佳匹配: {result} (Score: {score:.4f})")
+for sample in dataset_samples:
+    input_text = sample["q"]
+    candidates = sample["negs"] # 實際會有100個
+    candidates.append(sample["pos"])
+    result, score = predict_best_candidate(input_text, candidates)
+    print(f"最佳匹配: {result} (Score: {score:.4f})")
