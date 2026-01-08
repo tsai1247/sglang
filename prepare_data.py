@@ -2,17 +2,19 @@ import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
+from tqdm import tqdm
 
 # ----------------設定區----------------
 # 注意：Qwen3 目前可能尚未發布，此處以 Qwen2.5-32B 為例 (邏輯通用)
 # 如果您確實有權限存取 Qwen3，請直接替換 MODEL_ID
 # MODEL_ID = "Qwen/Qwen2.5-32B-Instruct" 
-MODEL_ID = "/home/ubuntu/models/Qwen/Qwen3-0.6B" 
+MODEL_ID = "/home/ubuntu/models/Qwen/Qwen3-1.7B" 
 
 # 為了節省記憶體，建議使用 4-bit 量化載入 (需要安裝 bitsandbytes)
 LOAD_IN_4BIT = False 
 # 生成步數 (每次輸入預設生成 50 個 token)
-NUM_STEPS = 10
+NUM_STEPS = 200
+HEAD_N = 50
 # 資料來源
 DATA_PATH = "./data.json"
 # -------------------------------------
@@ -39,8 +41,8 @@ model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
 
 def get_next_token_candidates(input_ids):
     input_tokens = tokenizer.convert_ids_to_tokens(input_ids)
-    print(f"輸入 Token IDs: {input_ids}")
-    print(f"輸入 Tokens: {input_tokens}")
+    # print(f"輸入 Token IDs: {input_ids}")
+    # print(f"輸入 Tokens: {input_tokens}")
 
     input_tensor = torch.tensor([input_ids], device=model.device)
     attention_mask = torch.ones_like(input_tensor)
@@ -89,9 +91,9 @@ def get_next_token_candidates(input_ids):
 # --- 執行程式 ---
 if __name__ == "__main__":
     with open(DATA_PATH, "r", encoding="utf-8") as f:
-        all_data = json.load(f)
+        all_data = json.load(f)[:HEAD_N]
 
-    for i, item in enumerate(all_data):
+    for i, item in tqdm(enumerate(all_data)):
         for j, convo in enumerate(item.get("conversations", [])):
             if convo.get("from") != "human":
                 continue
@@ -103,19 +105,19 @@ if __name__ == "__main__":
                 with open("tmp.jsonl", "a", encoding="utf-8") as f:
                     for step in range(NUM_STEPS):
                         current_prompt = tokenizer.decode(input_ids)
-                        print(f"\n=== Item {i} Convo {j} Step {step + 1}/{NUM_STEPS} ===")
-                        print(f"輸入 Prompt: '{current_prompt}'")
+                        # print(f"\n=== Item {i} Convo {j} Step {step + 1}/{NUM_STEPS} ===")
+                        # print(f"輸入 Prompt: '{current_prompt}'")
 
                         candidates_list, candidates_json, output_token, output_value, input_tokens = get_next_token_candidates(input_ids)
 
                         # 顯示結果
                         df = pd.DataFrame(candidates_list)
-                        print("\n=== 下一個 Token 的前 50 個候選 ===")
-                        print(df.to_string(index=False))
+                        # print("\n=== 下一個 Token 的前 50 個候選 ===")
+                        # print(df.to_string(index=False))
 
-                        print("\n" + "="*40)
+                        # print("\n" + "="*40)
                         print(f"模型決定的下一個 Token 是: '{output_value}'")
-                        print("="*40)
+                        # print("="*40)
 
                         record = {
                             "prompt": current_prompt,

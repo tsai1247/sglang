@@ -26,6 +26,7 @@ train_examples = []
 
 data = []
 import json
+import random
 with open('tmp.jsonl', 'r', encoding='utf-8') as f:
     for line in f:
         # 跳過空行或處理錯誤
@@ -56,13 +57,16 @@ for item in dataset_samples:
     for neg in item['negs']:
         train_examples.append(InputExample(texts=[item['q'], neg], label=0.0))
 
+random.shuffle(train_examples)
+train_examples = train_examples[:8000]
+
 # DataLoader
 train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=32)
 
 # --- 3. 訓練 ---
 # 這裡不需要特殊的 RankingLoss，因為我們把它轉化成了二元分類/回歸問題
 # 但模型學會的是：給定 (Input, Cand)，判斷它們的匹配程度
-num_epochs = 20
+num_epochs = 10
 warmup_steps = int(len(train_dataloader) * num_epochs * 0.1)
 
 model.fit(
@@ -72,6 +76,7 @@ model.fit(
     output_path='./cross_encoder_finetuned',
     show_progress_bar=True
 )
+model.save('./cross_encoder_finetuned')
 
 # --- 4. 推理 (Inference) ---
 # 當你拿到 100 個候選時：
